@@ -4,6 +4,7 @@ mod io_ext;
 mod lsm_tree;
 mod manifest;
 mod sstable;
+mod util;
 mod store_impl;
 
 mod store;
