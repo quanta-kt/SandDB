@@ -1,6 +1,5 @@
 use crate::{datastructure::lru::LruCache, io_ext::ReadExt};
 use std::{
-    collections::BTreeMap,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
@@ -13,7 +12,7 @@ pub trait SSTableReader {
 
     fn list_chunks(&mut self, sst_id: u64) -> Vec<ChunkDesc>;
 
-    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<BTreeMap<String, Vec<u8>>>;
+    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>>;
 
     fn chunk_iterator(&self, sst_id: u64) -> Self::ChunkIterator;
 
@@ -53,7 +52,7 @@ impl SSTableReader for FsSSTReader {
         SSTChunkIterator::open(sstable_path).unwrap()
     }
 
-    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<BTreeMap<String, Vec<u8>>> {
+    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
         let sstable_path = self.directory.join(format!("sstable_{sst_id:016}.sst"));
         RawSSTableReader::open(sstable_path)
             .unwrap()
@@ -63,7 +62,7 @@ impl SSTableReader for FsSSTReader {
 
 pub struct CachedSSTableReader<S: SSTableReader> {
     chunk_desc_cache: LruCache<String, Vec<ChunkDesc>>,
-    chunk_cache: LruCache<(u64, usize), BTreeMap<String, Vec<u8>>>,
+    chunk_cache: LruCache<(u64, usize), Vec<(String, Vec<u8>)>>,
     source: S,
 }
 
@@ -97,7 +96,7 @@ impl<S: SSTableReader> SSTableReader for CachedSSTableReader<S> {
         self.source.chunk_iterator(sst_id)
     }
 
-    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<BTreeMap<String, Vec<u8>>> {
+    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
         let key = (sst_id, chunk_index);
 
         self.chunk_cache.get(&key).cloned().or_else(|| {
@@ -146,14 +145,14 @@ where
         self.read_chunk_directory(footer.chunk_dir_pos, footer.chunk_count)
     }
 
-    pub fn read_chunk_at_index(mut self, chunk_index: usize) -> Option<BTreeMap<String, Vec<u8>>> {
+    pub fn read_chunk_at_index(mut self, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
         self.validate_header();
         let footer = self.read_footer();
 
         let chunk_descs = self.read_chunk_directory(footer.chunk_dir_pos, footer.chunk_count);
         let chunk_desc = chunk_descs.get(chunk_index).unwrap();
 
-        let chunk = self.read_chunk(chunk_desc.pos).collect();
+        let chunk = self.read_chunk(chunk_desc.pos);
         Some(chunk)
     }
 
@@ -196,7 +195,7 @@ where
         chunk_descs
     }
 
-    fn read_chunk(&mut self, pos: u64) -> impl Iterator<Item = (String, Vec<u8>)> {
+    fn read_chunk(&mut self, pos: u64) -> Vec<(String, Vec<u8>)> {
         self.file.seek(SeekFrom::Start(pos)).unwrap();
 
         let item_count = self.file.read_u32().unwrap();
@@ -205,11 +204,19 @@ where
         let _ = self.file.read_u64().unwrap();
         let _ = self.file.read_u64().unwrap();
 
-        (0..item_count).map(move |_| {
+        let mut result = Vec::with_capacity(item_count as usize);
+
+        let source = (0..item_count).map(move |_| {
             let key = self.file.read_string().unwrap();
             let value = self.file.read_bytes().unwrap();
             (key, value)
-        })
+        });
+
+        for item in source {
+            result.push(item);
+        }
+
+        result
     }
 }
 
@@ -245,7 +252,7 @@ impl Iterator for SSTChunkIterator {
         if let Some(chunk_desc) = chunk_desc {
             let chunk = self.reader.read_chunk(chunk_desc.pos);
             self.current_chunk_index += 1;
-            Some(chunk.collect())
+            Some(chunk)
         } else {
             None
         }

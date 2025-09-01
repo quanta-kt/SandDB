@@ -94,8 +94,8 @@ impl<S: SSTableReader> LSMTree<S> {
                 let chunk_data = self.sstable_reader.read_chunk(candidate.id, chunk.index);
 
                 if let Some(chunk_data) = chunk_data {
-                    if let Some(value) = chunk_data.get(key) {
-                        return Ok(Some(value.clone()));
+                    if let Ok(value) = chunk_data.binary_search_by_key(&key, |(k, _)| k) {
+                        return Ok(Some(chunk_data[value].1.clone()));
                     }
                 }
             }
