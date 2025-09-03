@@ -78,7 +78,7 @@ where
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let reader = ManifestReader::new(File::open("manifest").unwrap());
     /// let candidate_sstables: Vec<SSTable> = reader.get_candidate_sstables_for_key("key1").unwrap();
     /// ```
@@ -103,7 +103,7 @@ where
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let reader = ManifestReader::new(File::open("manifest").unwrap());
     /// let manifest: Manifest = reader.read().unwrap();
     /// let sstables: Vec<SSTable> = manifest.sstables;
@@ -121,14 +121,14 @@ where
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let reader = ManifestReader::new(File::open("manifest").unwrap());
     /// let manifest: Manifest = reader.read_skip_invalid().unwrap();
     /// let sstables: Vec<SSTable> = manifest.sstables;
     /// 
     /// assert_eq!(sstables.len(), 2);
     /// ```
-    pub fn read_skip_invalid(&mut self) -> Result<Manifest, io::Error> {
+    fn read_skip_invalid(&mut self) -> Result<Manifest, io::Error> {
         self.read_validate_header()?;
 
         let sstables = self.read_sstables(false)?;
@@ -141,7 +141,7 @@ where
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let reader = ManifestReader::new(File::open("manifest").unwrap());
     /// let next_sst_id = reader.read_validate_header().unwrap();
     /// ```
@@ -181,7 +181,7 @@ where
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let reader = ManifestReader::new(File::open("manifest").unwrap());
     /// let sstables: Vec<SSTable> = reader.read_sstables(true).unwrap();
     /// ```
@@ -284,7 +284,7 @@ where
 /// 
 /// Example:
 /// 
-/// ```no_run
+/// ```ignore
 /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
 /// let mut transaction = writer.transaction();
 /// transaction.add_sstable(0, "key1", "key2");
@@ -427,7 +427,7 @@ impl<'a> ManifestTransaction<'a> {
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
     /// let mut transaction = writer.transaction();
     /// transaction.add_sstable(0, "key1", "key2");
@@ -508,7 +508,7 @@ impl<'a> ManifestTransaction<'a> {
     /// 
     /// Example:
     /// 
-    /// ```no_run
+    /// ```ignore
     /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
     /// let mut transaction = writer.transaction();
     /// transaction.remove_sstable(0);
