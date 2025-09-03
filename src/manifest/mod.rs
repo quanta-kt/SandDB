@@ -1,3 +1,6 @@
+/// Manifest file readering and writing routines.
+/// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
+
 use std::{fs, io};
 use std::{
     fs::{File, OpenOptions},
@@ -46,6 +49,11 @@ enum ReadResult {
     Invalid,
 }
 
+/// Reader for manifest file.
+/// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
+/// 
+/// This struct is largly "use-once". The functions intentially *consume* the reader here for
+/// simplicity. For example, we don't have to rewind/seek the reader to prepare it for another use.
 pub struct ManifestReader<R>(R)
 where
     R: Read + Seek;
@@ -54,10 +62,26 @@ impl<R> ManifestReader<R>
 where
     R: Read + Seek,
 {
+    /// Create a new manifest reader.
     pub fn new(inner: R) -> Self {
         Self(inner)
     }
 
+    /// Determine the SSTables that may contain the given key.
+    /// This limits our search space before we actually begin to read SSTables from the disk.
+    /// 
+    /// An SSTable entry has a min key and max key describing the range of keys it contains.
+    /// 
+    /// Note that this does not actually read the SSTables from the disk and only returns
+    /// _descriptors/IDs_ of the SSTables which can be used to read the SSTables from the disk
+    /// using an [`SSTableReader`](crate::sstable::reader::SSTableReader).
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
+    /// let candidate_sstables: Vec<SSTable> = reader.get_candidate_sstables_for_key("key1").unwrap();
+    /// ```
     pub fn get_candidate_sstables_for_key(self, key: &str) -> io::Result<Vec<SSTable>> {
         Ok(self
             .read()?
@@ -67,6 +91,25 @@ where
             .collect())
     }
 
+    /// Reads the manifest file.
+    /// 
+    /// Returns a Vec of all SSTable descriptors in the manifest file.
+    /// 
+    /// We continue to read the manifest file ever after an invalid entry is encountered.
+    /// This behaviour is useful for recovering from corruption.
+    /// 
+    /// Sometimes it is desirable to read only until the last valid entry. For such times,
+    /// use [`read_skip_invalid`](Self::read_skip_invalid) instead.
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
+    /// let manifest: Manifest = reader.read().unwrap();
+    /// let sstables: Vec<SSTable> = manifest.sstables;
+    /// 
+    /// assert_eq!(sstables.len(), 2);
+    /// ```
     pub fn read(mut self) -> Result<Manifest, io::Error> {
         self.read_validate_header()?;
 
@@ -74,6 +117,17 @@ where
         Ok(Manifest { sstables })
     }
 
+    /// Reads the manifest file until a invalid entry is encountered.
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
+    /// let manifest: Manifest = reader.read_skip_invalid().unwrap();
+    /// let sstables: Vec<SSTable> = manifest.sstables;
+    /// 
+    /// assert_eq!(sstables.len(), 2);
+    /// ```
     pub fn read_skip_invalid(&mut self) -> Result<Manifest, io::Error> {
         self.read_validate_header()?;
 
@@ -81,6 +135,16 @@ where
         Ok(Manifest { sstables })
     }
 
+    /// Reads the manifest file header and returns the next SST ID.
+    /// 
+    /// When the header is invalid, this function returns an error.
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
+    /// let next_sst_id = reader.read_validate_header().unwrap();
+    /// ```
     fn read_validate_header(&mut self) -> io::Result<u64> {
         let magic = self.0.read_u32()?;
         let version = self.0.read_u8()?;
@@ -103,6 +167,24 @@ where
         Ok(next_sst_id)
     }
 
+    /// Reads the SSTables from the manifest file. Stopping at the first invalid entry
+    /// if `stop_at_invalid` is true. Otherwise, it will continue to read the manifest file,
+    /// trying to recover from corruption.
+    /// 
+    /// Each entry is prefixed with a CRC32C, this is used to determine if the entry is corrupt.
+    /// We try to recover from the corruption by attempting to read until either:
+    /// 
+    /// - We find a valid entry.
+    /// - We reach the end of the file.
+    /// 
+    /// Returns a Vec of all SSTable descriptors in the manifest file.
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
+    /// let sstables: Vec<SSTable> = reader.read_sstables(true).unwrap();
+    /// ```
     fn read_sstables(&mut self, stop_at_invalid: bool) -> io::Result<Vec<SSTable>> {
         let mut sstables = Vec::<Option<SSTable>>::new();
 
@@ -154,6 +236,7 @@ where
         Ok(sstables.into_iter().flatten().collect())
     }
 
+    /// Reads a single entry from the file from the current position.
     fn read_entry(&mut self) -> io::Result<ReadResult> {
         let crc = self.0.read_u32()?;
 
@@ -193,6 +276,26 @@ where
     }
 }
 
+/// Writer for manifest files.
+/// 
+/// Not thread-safe.
+/// 
+/// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
+/// 
+/// Example:
+/// 
+/// ```no_run
+/// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
+/// let mut transaction = writer.transaction();
+/// transaction.add_sstable(0, "key1", "key2");
+/// transaction.commit().unwrap();
+/// ```
+/// 
+/// This struct itself does not provide any write functionality. Instead, it provides a [`ManifestTransaction`]
+/// which can be used to write entries to the manifest file and atomically commited to the file.
+/// 
+/// Since the Transaction borrows the writer mutably, the borrow checker ensures that only one transation is running
+/// at a time.
 pub struct ManifestWriter {
     file: File,
 
@@ -201,6 +304,13 @@ pub struct ManifestWriter {
 }
 
 impl ManifestWriter {
+    /// Opens a manifest file for writing.
+    /// 
+    /// If the file does not exist, it will be created.
+    /// 
+    /// Additionally, creates a lock file to prevent multiple writers from writing to the same file.
+    /// 
+    /// On open, it will compact the manifest file if it already exists.
     pub fn open(path: PathBuf) -> io::Result<ManifestWriter> {
         let lock_path = path.clone().with_extension("lock");
 
@@ -278,6 +388,7 @@ impl ManifestWriter {
         txn.commit().unwrap();
     }
 
+    ///  Starts a new transaction. Writing to the manifest file is done through this transaction.
     pub fn transaction(&mut self) -> ManifestTransaction {
         ManifestTransaction {
             inner: self,
@@ -296,6 +407,10 @@ impl Drop for ManifestWriter {
     }
 }
 
+/// A manifest transaction.
+/// 
+/// This batches writes in a buffer so that they can be atomically commited to the file at the same time
+/// and avoiding partial writes or inconsistent states.
 pub struct ManifestTransaction<'a> {
     inner: &'a mut ManifestWriter,
     write_buf: Vec<u8>,
@@ -304,6 +419,20 @@ pub struct ManifestTransaction<'a> {
 }
 
 impl<'a> ManifestTransaction<'a> {
+    /// Commits the transaction to the manifest file.
+    /// 
+    /// All the buffered writes are flushed to the file at the same time.
+    /// 
+    /// Consumes the transaction so that it can't be used anymore.
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
+    /// let mut transaction = writer.transaction();
+    /// transaction.add_sstable(0, "key1", "key2");
+    /// transaction.commit().unwrap();
+    /// ```
     pub fn commit(self) -> io::Result<()> {
         if let Some(next_sst_id) = self.next_sst_id {
             self.inner.file.seek(SeekFrom::Start(5))?;
@@ -323,10 +452,17 @@ impl<'a> ManifestTransaction<'a> {
         Ok(())
     }
 
+    /// Cleans the manifest file when the transaction is committed.
+    /// 
+    /// Note that is does not clear entries that were previously added in this
+    /// transaction.
     fn clear(&mut self) {
         self.clear = true;
     }
 
+    /// Batch a new sstable addition to the manifest file.
+    /// 
+    /// Returns the ID of the added sstable that will be written to the file.
     pub fn add_sstable(&mut self, level: u8, min_key: &str, max_key: &str) -> u64 {
         let id = self.allocate_sstable_id();
         self.write_sstable_with_id(level, min_key, max_key, id);
@@ -368,6 +504,16 @@ impl<'a> ManifestTransaction<'a> {
         id
     }
 
+    /// Batch a sstable removal from the manifest file.
+    /// 
+    /// Example:
+    /// 
+    /// ```no_run
+    /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
+    /// let mut transaction = writer.transaction();
+    /// transaction.remove_sstable(0);
+    /// transaction.commit().unwrap();
+    /// ```
     pub fn remove_sstable(&mut self, id: u64) {
         let mut buf = Vec::new();
 
