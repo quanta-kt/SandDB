@@ -5,7 +5,7 @@ use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use super::{ChunkDesc, DEFAULT_PAGE_SIZE, MAGIC, VERSION};
+use super::{ChunkDesc, DEFAULT_PAGE_SIZE, MAGIC, VERSION, sst_file_path};
 
 pub struct SSTableWriter<F, K, V>
 where
@@ -32,8 +32,7 @@ where
         K: AsRef<str>,
         V: AsRef<[u8]>,
     {
-        let file_name = format!("sstable_{sst_id:016}.sst");
-        let file_path = directory.join(file_name);
+        let file_path = sst_file_path(&directory, sst_id);
         let mut file = File::create(file_path)?;
 
         let writer = SSTableWriter::new(&file);

@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::ChunkDesc;
+use super::{ChunkDesc, sst_file_path};
 
 pub trait SSTableReader {
     type ChunkIterator: Iterator<Item = Vec<(String, Vec<u8>)>> + 'static;
@@ -43,17 +43,17 @@ impl SSTableReader for FsSSTReader {
     type ChunkIterator = SSTChunkIterator;
 
     fn list_chunks(&mut self, sst_id: u64) -> Vec<ChunkDesc> {
-        let sstable_path = self.directory.join(format!("sstable_{sst_id:016}.sst"));
+        let sstable_path = sst_file_path(&self.directory, sst_id);
         RawSSTableReader::open(sstable_path).unwrap().list_chunks()
     }
 
     fn chunk_iterator(&self, sst_id: u64) -> Self::ChunkIterator {
-        let sstable_path = self.directory.join(format!("sstable_{sst_id:016}.sst"));
+        let sstable_path = sst_file_path(&self.directory, sst_id);
         SSTChunkIterator::open(sstable_path).unwrap()
     }
 
     fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
-        let sstable_path = self.directory.join(format!("sstable_{sst_id:016}.sst"));
+        let sstable_path = sst_file_path(&self.directory, sst_id);
         RawSSTableReader::open(sstable_path)
             .unwrap()
             .read_chunk_at_index(chunk_index)
