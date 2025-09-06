@@ -10,4 +10,4 @@ mod util;
 mod store;
 
 pub use store::Store;
-pub use store_impl::make_store;
+pub use store_impl::{DefaultStore, make_store};

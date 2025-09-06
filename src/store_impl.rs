@@ -9,7 +9,7 @@ use crate::store::Store;
 const MAX_SIZE: usize = 512;
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024; // 64 KiB
 
-struct StoreImpl<L: Store> {
+pub struct StoreImpl<L: Store> {
     memtable_size: usize,
     memtable: BTreeMap<String, Vec<u8>>,
     lsm_tree: L,
@@ -95,8 +95,24 @@ impl<L: Store> Drop for StoreImpl<L> {
     }
 }
 
-pub fn make_store(directory: PathBuf) -> io::Result<impl Store> {
-    StoreImpl::open(directory)
+pub struct DefaultStore(StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>);
+
+impl Store for DefaultStore {
+    fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+        self.0.insert(key, value)
+    }
+
+    fn insert_batch(&mut self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+        self.0.insert_batch(entries)
+    }
+
+    fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        self.0.get(key)
+    }
+}
+
+pub fn make_store(directory: PathBuf) -> io::Result<DefaultStore> {
+    Ok(DefaultStore(StoreImpl::open(directory)?))
 }
 
 #[cfg(test)]
