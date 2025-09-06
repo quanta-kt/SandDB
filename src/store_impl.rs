@@ -74,7 +74,7 @@ impl<L: Store> Store for StoreImpl<L> {
         Ok(())
     }
 
-    fn get(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         if let Some(value) = self.memtable.get(key) {
             return Ok(Some(value.to_owned()));
         }

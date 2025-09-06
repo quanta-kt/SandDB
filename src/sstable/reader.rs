@@ -1,5 +1,6 @@
 use crate::{datastructure::lru::LruCache, io_ext::ReadExt};
 use std::{
+    cell::RefCell,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
@@ -10,13 +11,13 @@ use super::{ChunkDesc, sst_file_path};
 pub trait SSTableReader {
     type ChunkIterator: Iterator<Item = Vec<(String, Vec<u8>)>> + 'static;
 
-    fn list_chunks(&mut self, sst_id: u64) -> Vec<ChunkDesc>;
+    fn list_chunks(&self, sst_id: u64) -> Vec<ChunkDesc>;
 
-    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>>;
+    fn read_chunk(&self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>>;
 
     fn chunk_iterator(&self, sst_id: u64) -> Self::ChunkIterator;
 
-    fn get_candidate_chunks_for_key(&mut self, sst_id: u64, key: &str) -> Vec<ChunkDesc> {
+    fn get_candidate_chunks_for_key(&self, sst_id: u64, key: &str) -> Vec<ChunkDesc> {
         let chunks = self.list_chunks(sst_id);
         chunks
             .into_iter()
@@ -42,7 +43,7 @@ impl FsSSTReader {
 impl SSTableReader for FsSSTReader {
     type ChunkIterator = SSTChunkIterator;
 
-    fn list_chunks(&mut self, sst_id: u64) -> Vec<ChunkDesc> {
+    fn list_chunks(&self, sst_id: u64) -> Vec<ChunkDesc> {
         let sstable_path = sst_file_path(&self.directory, sst_id);
         RawSSTableReader::open(sstable_path).unwrap().list_chunks()
     }
@@ -52,7 +53,7 @@ impl SSTableReader for FsSSTReader {
         SSTChunkIterator::open(sstable_path).unwrap()
     }
 
-    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
+    fn read_chunk(&self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
         let sstable_path = sst_file_path(&self.directory, sst_id);
         RawSSTableReader::open(sstable_path)
             .unwrap()
@@ -61,16 +62,16 @@ impl SSTableReader for FsSSTReader {
 }
 
 pub struct CachedSSTableReader<S: SSTableReader> {
-    chunk_desc_cache: LruCache<String, Vec<ChunkDesc>>,
-    chunk_cache: LruCache<(u64, usize), Vec<(String, Vec<u8>)>>,
+    chunk_desc_cache: RefCell<LruCache<String, Vec<ChunkDesc>>>,
+    chunk_cache: RefCell<LruCache<(u64, usize), Vec<(String, Vec<u8>)>>>,
     source: S,
 }
 
 impl<S: SSTableReader> CachedSSTableReader<S> {
     pub fn new(source: S) -> Self {
         Self {
-            chunk_desc_cache: LruCache::new(512),
-            chunk_cache: LruCache::new(1024),
+            chunk_desc_cache: RefCell::new(LruCache::new(512)),
+            chunk_cache: RefCell::new(LruCache::new(1024)),
             source,
         }
     }
@@ -79,14 +80,15 @@ impl<S: SSTableReader> CachedSSTableReader<S> {
 impl<S: SSTableReader> SSTableReader for CachedSSTableReader<S> {
     type ChunkIterator = S::ChunkIterator;
 
-    fn list_chunks(&mut self, sst_id: u64) -> Vec<ChunkDesc> {
-        self.chunk_desc_cache
+    fn list_chunks(&self, sst_id: u64) -> Vec<ChunkDesc> {
+        let mut chunk_desc_cache = self.chunk_desc_cache.borrow_mut();
+
+        chunk_desc_cache
             .get(&format!("sst_{sst_id}"))
             .cloned()
             .unwrap_or_else(|| {
                 let chunks = self.source.list_chunks(sst_id);
-                self.chunk_desc_cache
-                    .put(format!("sst_{sst_id}"), chunks.clone());
+                chunk_desc_cache.put(format!("sst_{sst_id}"), chunks.clone());
 
                 chunks
             })
@@ -96,17 +98,19 @@ impl<S: SSTableReader> SSTableReader for CachedSSTableReader<S> {
         self.source.chunk_iterator(sst_id)
     }
 
-    fn read_chunk(&mut self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
+    fn read_chunk(&self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
         let key = (sst_id, chunk_index);
 
-        self.chunk_cache.get(&key).cloned().or_else(|| {
+        let mut chunk_cache = self.chunk_cache.borrow_mut();
+
+        chunk_cache.get(&key).cloned().or_else(|| {
             let chunk = self.source.read_chunk(sst_id, chunk_index);
 
             if let Some(chunk) = chunk {
-                self.chunk_cache.put(key, chunk.clone());
+                chunk_cache.put(key, chunk.clone());
             }
 
-            self.chunk_cache.get(&key).cloned()
+            chunk_cache.get(&key).cloned()
         })
     }
 }
