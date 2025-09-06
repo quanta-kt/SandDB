@@ -1,9 +1,9 @@
-use std::collections::BinaryHeap;
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 /// Merges multiple sorted iterators into a single sorted iterator, removing duplicates.
 /// The iterators must be sorted.
-/// 
+///
 /// # Example
 /// ```ignore
 /// let iter1 = vec![1, 2, 3].into_iter();
