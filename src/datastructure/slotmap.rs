@@ -280,6 +280,64 @@ impl<T> SlotMap<T> {
         self.remove_from_slot_index(node.index);
     }
 
+    /// Moves a node to the front of the list.
+    ///
+    /// If the node is not present in the list, this will return None.
+    ///
+    /// The original handle is invalidated and can no longer be used to access the node.
+    /// The returned handle should be used instead.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut map = SlotMap::new();
+    /// let node = map.push_front(1);
+    /// map.push_front(2);
+    /// map.push_front(3);
+    ///
+    /// let new_node = map.move_to_front(node).unwrap();
+    ///
+    /// assert_eq!(map.iter().collect::<Vec<_>>(), vec![&1, &3, &2]);
+    /// assert_eq!(map.get(node), None);
+    /// assert_eq!(map.get(new_node), Some(&1));
+    /// ```
+    pub fn move_to_front(&mut self, node: NodeHandle<T>) -> Option<NodeHandle<T>> {
+        let slot = &mut self.slots[node.index];
+
+        if slot.generation != node.generation {
+            return None;
+        }
+
+        if slot.value.is_none() {
+            return None;
+        }
+
+        let prev = slot.prev;
+        let next = slot.next;
+
+        slot.next = self.head;
+        slot.prev = None;
+
+        if let Some(next) = next {
+            self.slots[next].prev = prev;
+        }
+
+        if let Some(prev) = prev {
+            self.slots[prev].next = next;
+        }
+
+        self.head = Some(node.index);
+
+        let generation = self.slots[node.index].generation + 1;
+
+        self.slots[node.index].generation = generation;
+
+        Some(NodeHandle {
+            index: node.index,
+            generation,
+            phantom: PhantomData,
+        })
+    }
+
     /// Removes a node from the list at a slot index.
     /// Assumes that the slot is valid and has a value.
     ///
@@ -403,5 +461,19 @@ mod tests {
         list.remove(node);
 
         assert_eq!(list.iter().collect::<Vec<_>>(), vec![&4, &3, &1, &0]);
+    }
+
+    #[test]
+    fn test_can_move_node_to_front() {
+        let mut list = SlotMap::new();
+        let old_node = list.push_front(1);
+        list.push_front(2);
+        list.push_front(3);
+
+        let new_node = list.move_to_front(old_node).unwrap();
+
+        assert_eq!(list.iter().collect::<Vec<_>>(), vec![&1, &3, &2]);
+        assert_eq!(list.get(old_node), None);
+        assert_eq!(list.get(new_node), Some(&1));
     }
 }

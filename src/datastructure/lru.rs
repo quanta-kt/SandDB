@@ -27,10 +27,12 @@ where
         let entry = self.map.get_mut(key);
 
         if let Some(entry) = entry {
-            let mut node = self.list.push_front(key.clone());
+            let new_node = self
+                .list
+                .move_to_front(entry.1)
+                .expect("BUG(LRU): node existed in the hashmap but not present in the list.");
 
-            std::mem::swap(&mut entry.1, &mut node);
-            self.list.remove(node);
+            entry.1 = new_node;
 
             Some(&entry.0)
         } else {
