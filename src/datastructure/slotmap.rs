@@ -55,13 +55,24 @@ use std::marker::PhantomData;
 ///
 /// assert_eq!(map.get(handle), Some(&10));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct NodeHandle<T> {
     index: usize,
     generation: u64,
-
     phantom: PhantomData<T>,
 }
+
+impl<T> Clone for NodeHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            generation: self.generation,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> Copy for NodeHandle<T> {}
 
 #[derive(Default)]
 struct Slot<T> {
