@@ -82,7 +82,7 @@ impl<S: SSTableReader> LSMTree<S> {
         Ok(manifest)
     }
 
-    pub fn get(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         let candidate_ssts = self.manifest_reader().get_candidate_sstables_for_key(key)?;
 
         for candidate in candidate_ssts.iter().rev() {
@@ -240,7 +240,7 @@ impl<S: SSTableReader> Drop for LSMTree<S> {
 }
 
 impl<S: SSTableReader> Store for LSMTree<S> {
-    fn get(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         LSMTree::get(self, key)
     }
 
