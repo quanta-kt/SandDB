@@ -14,7 +14,7 @@ use crate::{
         SSTableWriter,
         reader::{CachedSSTableReader, FsSSTReader, SSTableReader},
     },
-    util::merge_sorted_uniq,
+    util::{KeyOnlyOrd, merge_sorted_uniq},
 };
 
 const DB_LOCK_FILENAME: &str = ".lock";
@@ -178,7 +178,12 @@ impl<S: SSTableReader> LSMTree<S> {
         Ok(true)
     }
 
-    fn merge_ssts(&mut self, to_merge: Vec<SSTable>, target_level: u8) -> io::Result<()> {
+    fn merge_ssts(&mut self, mut to_merge: Vec<SSTable>, target_level: u8) -> io::Result<()> {
+        // Since we want to keep the most recent value for a key, we need to reverse the list
+        // to pick the most recent value for a key as manifest is ordered oldest to most recent.
+        // See [`util::merge_sorted_uniq`].
+        to_merge.reverse();
+
         let min_key = to_merge
             .iter()
             .map(|it| it.min_key.as_str())
@@ -197,11 +202,15 @@ impl<S: SSTableReader> LSMTree<S> {
             .iter()
             .map(|table| {
                 let reader = FsSSTReader::new(self.directory.clone());
-                reader.chunk_iterator(table.id).flatten()
+                reader
+                    .chunk_iterator(table.id)
+                    .flatten()
+                    // Order and de-dup based only on the key
+                    .map(Into::<KeyOnlyOrd>::into)
             })
             .collect::<Vec<_>>();
 
-        let merged = merge_sorted_uniq(sources);
+        let merged = merge_sorted_uniq(sources).map(Into::<(String, Vec<u8>)>::into);
 
         let mut txn = self.manifest_writer.transaction();
         txn.remove_sstables(to_merge.iter().map(|it| it.id).collect());
@@ -300,5 +309,52 @@ mod tests {
                 assert!(sstables.len() <= COMPACT_EVERY_N_SSTABLES as usize);
             }
         }
+    }
+
+    #[test]
+    fn test_sst_merge() {
+        let path = PathBuf::from("test_sst_merge");
+        let _ = fs::remove_dir_all(path.clone());
+        fs::create_dir_all(path.clone()).unwrap();
+
+        let mut tree = LSMTree::new(path.clone()).unwrap();
+
+        tree.write_sstable(&BTreeMap::from([
+            ("key1".to_string(), "value1".as_bytes().to_vec()),
+            ("key2".to_string(), "value2".as_bytes().to_vec()),
+            ("key3".to_string(), "value3".as_bytes().to_vec()),
+        ]))
+        .unwrap();
+
+        tree.write_sstable(&BTreeMap::from([
+            ("key2".to_string(), "value2-new".as_bytes().to_vec()),
+            ("key3".to_string(), "value3-new".as_bytes().to_vec()),
+        ]))
+        .unwrap();
+
+        let ssts = tree.manifest_reader().read().unwrap();
+
+        tree.merge_ssts(ssts.sstables, 1).unwrap();
+
+        // We expect these SSTables to be merged into a single SSTable at level 1, with ID 2
+
+        // Verify manifest
+        let manifest_reader = ManifestReader::new(File::open(path.join("manifest")).unwrap());
+        let sstables = manifest_reader.read().unwrap();
+        assert_eq!(sstables.sstables.len(), 1);
+        assert_eq!(sstables.sstables[0].id, 2);
+        assert_eq!(sstables.sstables[0].level, 1);
+        assert_eq!(sstables.sstables[0].min_key, "key1");
+
+        // Verify SSTable
+        let sstable_reader = FsSSTReader::new(path.clone());
+        let sstable = sstable_reader.read_chunk(2, 0).unwrap();
+        assert_eq!(sstable.len(), 3);
+        assert_eq!(sstable[0].0, "key1");
+        assert_eq!(sstable[0].1, "value1".as_bytes().to_vec());
+        assert_eq!(sstable[1].0, "key2");
+        assert_eq!(sstable[1].1, "value2-new".as_bytes().to_vec());
+        assert_eq!(sstable[2].0, "key3");
+        assert_eq!(sstable[2].1, "value3-new".as_bytes().to_vec());
     }
 }
