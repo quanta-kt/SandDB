@@ -1,5 +1,6 @@
 /// Manifest file readering and writing routines.
 /// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
+use std::ops::RangeBounds;
 use std::{fs, io};
 use std::{
     fs::{File, OpenOptions},
@@ -87,6 +88,18 @@ where
             .sstables
             .into_iter()
             .filter(|sstable| sstable.min_key.as_str() <= key && sstable.max_key.as_str() >= key)
+            .collect())
+    }
+
+    pub fn get_candidate_sstables_for_range<Range: RangeBounds<str>>(
+        self,
+        range: Range,
+    ) -> io::Result<Vec<SSTable>> {
+        Ok(self
+            .read()?
+            .sstables
+            .into_iter()
+            .filter(|sstable| range.contains(&sstable.min_key) || range.contains(&sstable.max_key))
             .collect())
     }
 

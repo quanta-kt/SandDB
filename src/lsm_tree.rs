@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io,
+    ops::RangeBounds,
     path::{Path, PathBuf},
 };
 
@@ -102,6 +103,52 @@ impl<S: SSTableReader> LSMTree<S> {
         }
 
         Ok(None)
+    }
+
+    pub fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
+        &'a self,
+        range: R,
+    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
+        let mut candidate_ssts = self
+            .manifest_reader()
+            .get_candidate_sstables_for_range(range.clone())?;
+
+        // Since manifest is ordered oldest to most recent, we need to reverse the list
+        // to pick the most recent entries during the merge.
+        candidate_ssts.reverse();
+
+        let iter = candidate_ssts
+            .into_iter()
+            .map(move |candidate| {
+                let candidate_id = candidate.id;
+
+                let candidate_chunks: Vec<_> = self
+                    .sstable_reader
+                    .get_candidate_chunks_for_range(candidate_id, range.clone())
+                    .into_iter()
+                    .collect();
+
+                let range = range.clone();
+
+                candidate_chunks
+                    .into_iter()
+                    .flat_map(move |chunk| {
+                        let range = range.clone();
+
+                        // FIXME: Evaluate if it should be OK to cache range queries.
+                        // especially when they are large. I suspect this could pollute
+                        // the cache with pages that might never be used again.
+                        self.sstable_reader
+                            .read_chunk(candidate_id, chunk.index)
+                            .into_iter()
+                            .flatten()
+                            .filter(move |(key, _)| range.contains(key.as_str()))
+                    })
+                    .map(Into::<KeyOnlyOrd>::into)
+            })
+            .collect::<Vec<_>>();
+
+        Ok(merge_sorted_uniq(iter).map(Into::<(String, Vec<u8>)>::into))
     }
 
     pub fn write_sstable(&mut self, source: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
@@ -251,6 +298,13 @@ impl<S: SSTableReader> Drop for LSMTree<S> {
 impl<S: SSTableReader> Store for LSMTree<S> {
     fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         LSMTree::get(self, key)
+    }
+
+    fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
+        &'a self,
+        range: R,
+    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
+        LSMTree::get_range(self, range)
     }
 
     fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {

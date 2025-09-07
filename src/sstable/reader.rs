@@ -3,6 +3,7 @@ use std::{
     cell::RefCell,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
+    ops::RangeBounds,
     path::PathBuf,
 };
 
@@ -22,6 +23,18 @@ pub trait SSTableReader {
         chunks
             .into_iter()
             .filter(move |chunk| chunk.min_key.as_str() <= key && chunk.max_key.as_str() >= key)
+            .collect()
+    }
+
+    fn get_candidate_chunks_for_range<Range: RangeBounds<str>>(
+        &self,
+        sst_id: u64,
+        range: Range,
+    ) -> Vec<ChunkDesc> {
+        let chunks = self.list_chunks(sst_id);
+        chunks
+            .into_iter()
+            .filter(move |chunk| range.contains(&chunk.min_key) || range.contains(&chunk.max_key))
             .collect()
     }
 }
