@@ -80,6 +80,24 @@ fn main() -> io::Result<()> {
                 }
             }
 
+            "list" => {
+                match store.get_range(..) {
+                    Ok(iter) => {
+                        for (key, value) in iter {
+                            let escaped: Vec<u8> = value.iter()
+                                .map(|it| std::ascii::escape_default(*it))
+                                .flatten()
+                                .collect();
+                            let value = String::from_utf8_lossy(&escaped);
+
+                            eprintln!("{key} => {value}");
+                        }
+                    }
+
+                    Err(e) => eprintln!("Failed to list keys: {e}")
+                }
+            }
+
             cmd => {
                 eprintln!("Unknown command: {cmd}");
             }
