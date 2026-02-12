@@ -59,7 +59,11 @@ fn main() -> io::Result<()> {
                 };
 
                 if let Some(value) = value {
-                    eprintln!("{}", String::from_utf8_lossy(&value));
+                    let escaped: Vec<_> = value.iter()
+                        .map(|it| std::ascii::escape_default(*it))
+                        .flatten()
+                        .collect();
+                    eprintln!("{}", String::from_utf8_lossy(&escaped));
                 } else {
                     eprintln!("Key not found");
                 }
