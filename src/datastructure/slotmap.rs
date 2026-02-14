@@ -311,6 +311,18 @@ impl<T> SlotMap<T> {
             return None;
         }
 
+        slot.generation += 1;
+        let generation = slot.generation;
+
+        // This is already the head, don't move anything.
+        if Some(node.index) == self.head {
+            return Some(NodeHandle {
+                index: node.index,
+                generation,
+                phantom: PhantomData,
+            });
+        }
+
         let prev = slot.prev;
         let next = slot.next;
 
@@ -326,10 +338,6 @@ impl<T> SlotMap<T> {
         }
 
         self.head = Some(node.index);
-
-        let generation = self.slots[node.index].generation + 1;
-
-        self.slots[node.index].generation = generation;
 
         Some(NodeHandle {
             index: node.index,
@@ -475,5 +483,14 @@ mod tests {
         assert_eq!(list.iter().collect::<Vec<_>>(), vec![&1, &3, &2]);
         assert_eq!(list.get(old_node), None);
         assert_eq!(list.get(new_node), Some(&1));
+    }
+
+    #[test]
+    fn test_moving_head_to_top_does_not_create_cycle() {
+        let mut list = SlotMap::<i32>::new_with_capacity(10);
+
+        let handle = list.push_front(0);
+        list.move_to_front(handle);
+        assert_eq!(list.slots[0].next, None);
     }
 }
