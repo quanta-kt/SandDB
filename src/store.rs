@@ -13,4 +13,6 @@ pub trait Store {
         &'a self,
         range: R,
     ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a>;
+
+    fn flush(&mut self) -> io::Result<()>;
 }

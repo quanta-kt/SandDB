@@ -7,6 +7,7 @@ use crate::lsm_tree::LSMTree;
 use crate::sstable::reader::{CachedSSTableReader, FsSSTReader};
 use crate::store::Store;
 use crate::util::{KeyOnlyOrd, merge_sorted_uniq};
+use crate::wal::WalStore;
 
 const MAX_SIZE: usize = 512;
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024; // 64 KiB
@@ -107,21 +108,29 @@ impl<L: Store> Store for StoreImpl<L> {
         ])
         .map(Into::<(String, Vec<u8>)>::into))
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.memtable.is_empty() {
+            return self.lsm_tree.flush();
+        }
+
+        if let Err(e) = self.flush_memtable() {
+            eprintln!("Error flushing memtable: {e}");
+        }
+
+        return self.lsm_tree.flush();
+    }
 }
 
 impl<L: Store> Drop for StoreImpl<L> {
     fn drop(&mut self) {
-        if self.memtable.is_empty() {
-            return;
-        }
-
-        if let Err(e) = self.flush_memtable() {
-            eprintln!("Error flushing memtable on drop: {e}");
+        if let Err(e) = self.flush() {
+            eprintln!("Unable to flush store: {e}");
         }
     }
 }
 
-pub struct DefaultStore(StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>);
+pub struct DefaultStore(WalStore<StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>>);
 
 impl Store for DefaultStore {
     fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
@@ -142,10 +151,22 @@ impl Store for DefaultStore {
     ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
         self.0.get_range(range)
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 pub fn make_store(directory: PathBuf) -> io::Result<DefaultStore> {
-    Ok(DefaultStore(StoreImpl::open(directory)?))
+    let mut wal_path = directory.clone();
+    wal_path.push("wal.log");
+    
+    let store = StoreImpl::open(directory)?;
+    let mut wal_store = WalStore::new(store, &wal_path);
+
+    wal_store.restore()?;
+
+    Ok(DefaultStore(wal_store))
 }
 
 #[cfg(test)]
