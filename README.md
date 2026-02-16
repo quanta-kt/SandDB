@@ -13,7 +13,7 @@ A lot of inspiration comes from [RocksDB](https://github.com/facebook/rocksdb) a
 - [x] Read/write operations
 - [x] SSTable compaction
 - [ ] Bloom filters
-- [ ] Durability with WAL
+- [x] Durability with WAL
 - [ ] Atomicity via MVCC snapshots
 - [ ] C API
 - [ ] TCP server interface

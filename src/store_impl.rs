@@ -7,6 +7,7 @@ use crate::lsm_tree::LSMTree;
 use crate::sstable::reader::{CachedSSTableReader, FsSSTReader};
 use crate::store::Store;
 use crate::util::{KeyOnlyOrd, merge_sorted_uniq};
+use crate::wal::Wal;
 
 const MAX_SIZE: usize = 512;
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024; // 64 KiB
@@ -15,36 +16,48 @@ pub struct StoreImpl<L: Store> {
     memtable_size: usize,
     memtable: BTreeMap<String, Vec<u8>>,
     lsm_tree: L,
+    wal: Wal,
 }
 
 impl StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>> {
     pub fn open(
         directory: PathBuf,
     ) -> io::Result<StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>> {
-        let lsm_tree = LSMTree::new(directory)?;
-        StoreImpl::new(lsm_tree)
+        let mut lsm_tree = LSMTree::new(directory.clone())?;
+        let mut wal = Wal::new(&directory)?;
+
+        let batch = BTreeMap::from_iter(wal.restore()?);
+
+        if !batch.is_empty() {
+            lsm_tree.insert_batch(&batch)?;
+            lsm_tree.flush()?;
+        }
+
+        wal.truncate()?;
+
+        StoreImpl::new(lsm_tree, wal)
     }
 }
 
 impl<L: Store> StoreImpl<L> {
-    fn new(lsm_tree: L) -> io::Result<StoreImpl<L>> {
+    fn new(lsm_tree: L, wal: Wal) -> io::Result<StoreImpl<L>> {
         Ok(StoreImpl {
             memtable_size: 0,
             memtable: BTreeMap::new(),
             lsm_tree,
+            wal,
         })
     }
 
     fn flush_memtable(&mut self) -> io::Result<()> {
         self.lsm_tree.insert_batch(&self.memtable)?;
         self.memtable.clear();
+        self.wal.truncate()?;
 
         Ok(())
     }
-}
 
-impl<L: Store> Store for StoreImpl<L> {
-    fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+    fn validate(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         if key.len() > MAX_SIZE {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Key too long"));
         }
@@ -56,21 +69,45 @@ impl<L: Store> Store for StoreImpl<L> {
             ));
         }
 
-        self.memtable_size += key.len() + value.len();
+        return Ok(())
+    }
 
+    fn maybe_flush_memtable(&mut self) -> io::Result<()> {
         if self.memtable_size > MAX_MEMTABLE_SIZE {
             self.flush_memtable()?;
-            self.memtable_size = key.len() + value.len();
+            self.memtable_size = 0;
         }
 
+        Ok(())
+    }
+
+    fn add_to_memtable(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         self.memtable.insert(key.to_owned(), value.to_owned());
+        self.memtable_size += key.len() + value.len();
+        self.maybe_flush_memtable()?;
+
+        Ok(())
+    }
+}
+
+impl<L: Store> Store for StoreImpl<L> {
+    fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+        self.validate(key, value)?;
+        self.wal.log_one(key, value)?;
+        self.add_to_memtable(key, value)?;
 
         Ok(())
     }
 
     fn insert_batch(&mut self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+        for (key, value) in entries {
+            self.validate(key, value)?;
+        }
+
+        self.wal.log_many(entries)?;
+
         for (key, value) in entries.iter() {
-            self.insert(key, value)?;
+            self.add_to_memtable(key, value)?;
         }
 
         Ok(())
@@ -107,16 +144,24 @@ impl<L: Store> Store for StoreImpl<L> {
         ])
         .map(Into::<(String, Vec<u8>)>::into))
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.memtable.is_empty() {
+            return self.lsm_tree.flush();
+        }
+
+        if let Err(e) = self.flush_memtable() {
+            eprintln!("Error flushing memtable: {e}");
+        }
+
+        return self.lsm_tree.flush();
+    }
 }
 
 impl<L: Store> Drop for StoreImpl<L> {
     fn drop(&mut self) {
-        if self.memtable.is_empty() {
-            return;
-        }
-
-        if let Err(e) = self.flush_memtable() {
-            eprintln!("Error flushing memtable on drop: {e}");
+        if let Err(e) = self.flush() {
+            eprintln!("Unable to flush store: {e}");
         }
     }
 }
@@ -142,10 +187,14 @@ impl Store for DefaultStore {
     ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
         self.0.get_range(range)
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 pub fn make_store(directory: PathBuf) -> io::Result<DefaultStore> {
-    Ok(DefaultStore(StoreImpl::open(directory)?))
+    Ok(DefaultStore(StoreImpl::open(directory.clone())?))
 }
 
 #[cfg(test)]

@@ -22,15 +22,19 @@ const fn make_table() -> [u32; 256] {
 
 static CRC32C_TABLE: [u32; 256] = make_table();
 
-pub fn crc32c(data: &[u8]) -> u32 {
+pub fn crc32c_iter(data: impl Iterator<Item = u8>) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
 
-    for &byte in data {
+    for byte in data {
         let index = (crc ^ (byte as u32)) & 0xFF;
         crc = CRC32C_TABLE[index as usize] ^ (crc >> 8);
     }
 
     crc ^ 0xFFFF_FFFF
+}
+
+pub fn crc32c(data: &[u8]) -> u32 {
+    crc32c_iter(data.iter().cloned())
 }
 
 #[cfg(test)]

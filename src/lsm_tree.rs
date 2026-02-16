@@ -316,6 +316,11 @@ impl<S: SSTableReader> Store for LSMTree<S> {
     fn insert_batch(&mut self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
         self.write_sstable(entries)
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // This store always writes to disk on insert, so we don't really need to flush here.
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ mod manifest;
 mod sstable;
 mod store_impl;
 mod util;
+mod wal;
 
 mod store;
 
