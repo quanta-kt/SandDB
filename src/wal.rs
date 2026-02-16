@@ -63,6 +63,7 @@ impl<S: Store> WalStore<S> {
     fn write_one(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         self.wal.write_string(key)?;
         self.wal.write_bytes(value)?;
+        self.wal.sync_all()?;
         Ok(())
     }
 
