@@ -119,11 +119,11 @@ impl<S: SSTableReader> SSTableReader for CachedSSTableReader<S> {
         chunk_cache.get(&key).cloned().or_else(|| {
             let chunk = self.source.read_chunk(sst_id, chunk_index);
 
-            if let Some(chunk) = chunk {
+            if let Some(ref chunk) = chunk {
                 chunk_cache.put(key, chunk.clone());
             }
 
-            chunk_cache.get(&key).cloned()
+            chunk
         })
     }
 }
