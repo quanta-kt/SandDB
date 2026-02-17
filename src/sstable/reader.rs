@@ -1,11 +1,11 @@
 use crate::{datastructure::lru::LruCache, io_ext::ReadExt};
 use std::{
-    cell::RefCell,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     ops::RangeBounds,
     path::PathBuf,
 };
+use std::sync::Mutex;
 
 use super::{ChunkDesc, sst_file_path};
 
@@ -75,16 +75,16 @@ impl SSTableReader for FsSSTReader {
 }
 
 pub struct CachedSSTableReader<S: SSTableReader> {
-    chunk_desc_cache: RefCell<LruCache<String, Vec<ChunkDesc>>>,
-    chunk_cache: RefCell<LruCache<(u64, usize), Vec<(String, Vec<u8>)>>>,
+    chunk_desc_cache: Mutex<LruCache<String, Vec<ChunkDesc>>>,
+    chunk_cache: Mutex<LruCache<(u64, usize), Vec<(String, Vec<u8>)>>>,
     source: S,
 }
 
 impl<S: SSTableReader> CachedSSTableReader<S> {
     pub fn new(source: S) -> Self {
         Self {
-            chunk_desc_cache: RefCell::new(LruCache::new(512)),
-            chunk_cache: RefCell::new(LruCache::new(1024)),
+            chunk_desc_cache: Mutex::new(LruCache::new(512)),
+            chunk_cache: Mutex::new(LruCache::new(1024)),
             source,
         }
     }
@@ -94,7 +94,7 @@ impl<S: SSTableReader> SSTableReader for CachedSSTableReader<S> {
     type ChunkIterator = S::ChunkIterator;
 
     fn list_chunks(&self, sst_id: u64) -> Vec<ChunkDesc> {
-        let mut chunk_desc_cache = self.chunk_desc_cache.borrow_mut();
+        let mut chunk_desc_cache = self.chunk_desc_cache.lock().expect("unable to acquire LRU cache mutex");
 
         chunk_desc_cache
             .get(&format!("sst_{sst_id}"))
@@ -114,7 +114,7 @@ impl<S: SSTableReader> SSTableReader for CachedSSTableReader<S> {
     fn read_chunk(&self, sst_id: u64, chunk_index: usize) -> Option<Vec<(String, Vec<u8>)>> {
         let key = (sst_id, chunk_index);
 
-        let mut chunk_cache = self.chunk_cache.borrow_mut();
+        let mut chunk_cache = self.chunk_cache.lock().expect("unable to acquire LRU cache mutex");
 
         chunk_cache.get(&key).cloned().or_else(|| {
             let chunk = self.source.read_chunk(sst_id, chunk_index);
