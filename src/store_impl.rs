@@ -52,6 +52,7 @@ impl<L: Store> StoreImpl<L> {
     fn flush_memtable(&mut self) -> io::Result<()> {
         self.lsm_tree.insert_batch(&self.memtable)?;
         self.memtable.clear();
+        self.memtable_size = 0;
         self.wal.truncate()?;
 
         Ok(())
@@ -75,7 +76,6 @@ impl<L: Store> StoreImpl<L> {
     fn maybe_flush_memtable(&mut self) -> io::Result<()> {
         if self.memtable_size > MAX_MEMTABLE_SIZE {
             self.flush_memtable()?;
-            self.memtable_size = 0;
         }
 
         Ok(())
