@@ -13,7 +13,7 @@ fn main() -> io::Result<()> {
 
     let directory = PathBuf::from(&args[1]);
 
-    let mut store = match make_store(directory) {
+    let store = match make_store(directory) {
         Ok(store) => store,
 
         Err(e) => {

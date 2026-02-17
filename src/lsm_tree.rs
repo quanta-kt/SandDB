@@ -5,6 +5,9 @@ use std::{
     ops::RangeBounds,
     path::{Path, PathBuf},
 };
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use fs2::FileExt;
 
@@ -29,10 +32,10 @@ pub struct LSMTree<S: SSTableReader> {
     directory: PathBuf,
     lock: Option<File>,
 
-    manifest_writer: ManifestWriter,
+    manifest_writer: Mutex<ManifestWriter>,
     sstable_reader: S,
 
-    level_zero_count: u8,
+    level_zero_count: AtomicU8,
 }
 
 fn sst_file_path(directory: &Path, id: u64) -> PathBuf {
@@ -60,9 +63,9 @@ impl LSMTree<CachedSSTableReader<FsSSTReader>> {
         Ok(Self {
             directory,
             lock: Some(lock),
-            manifest_writer,
+            manifest_writer: Mutex::new(manifest_writer),
             sstable_reader,
-            level_zero_count: 0,
+            level_zero_count: AtomicU8::new(0),
         })
     }
 }
@@ -74,11 +77,14 @@ impl<S: SSTableReader> LSMTree<S> {
         ManifestReader::new(manifest_file)
     }
 
-    fn read_manifest(&mut self) -> Result<Manifest, io::Error> {
+    fn read_manifest(&self) -> Result<Manifest, io::Error> {
         let manifest = self.manifest_reader().read()?;
 
         // Each time we read the manifest, we update the level zero count
-        self.level_zero_count = manifest.sstables.iter().filter(|it| it.level == 0).count() as u8;
+        self.level_zero_count.store(
+            manifest.sstables.iter().filter(|it| it.level == 0).count() as u8, 
+            Ordering::Relaxed
+        );
 
         Ok(manifest)
     }
@@ -151,7 +157,7 @@ impl<S: SSTableReader> LSMTree<S> {
         Ok(merge_sorted_uniq(iter).map(Into::<(String, Vec<u8>)>::into))
     }
 
-    pub fn write_sstable(&mut self, source: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+    pub fn write_sstable(&self, source: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
         self.compact()?;
 
         let max_key = source
@@ -166,7 +172,8 @@ impl<S: SSTableReader> LSMTree<S> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source is empty"))?
             .0;
 
-        let mut txn = self.manifest_writer.transaction();
+        let mut writer = self.manifest_writer.lock().unwrap();
+        let mut txn = writer.transaction();
         let id = txn.add_sstable(0, min_key, max_key);
 
         SSTableWriter::write_sstable(
@@ -180,13 +187,13 @@ impl<S: SSTableReader> LSMTree<S> {
 
         txn.commit()?;
 
-        self.level_zero_count += 1;
+        self.level_zero_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
 
-    pub fn compact(&mut self) -> io::Result<()> {
-        if self.level_zero_count < COMPACT_EVERY_N_SSTABLES {
+    pub fn compact(&self) -> io::Result<()> {
+        if self.level_zero_count.load(Ordering::Relaxed) < COMPACT_EVERY_N_SSTABLES {
             return Ok(());
         }
 
@@ -202,7 +209,7 @@ impl<S: SSTableReader> LSMTree<S> {
         }
     }
 
-    fn compact_level(&mut self, level: u8) -> io::Result<bool> {
+    fn compact_level(&self, level: u8) -> io::Result<bool> {
         let to_compact = self
             .read_manifest()?
             .sstables
@@ -219,13 +226,13 @@ impl<S: SSTableReader> LSMTree<S> {
 
         if level == 0 {
             // We've compacted all level zero sstables, so we reset the count
-            self.level_zero_count = 0;
+            self.level_zero_count.store(0, Ordering::Relaxed);
         }
 
         Ok(true)
     }
 
-    fn merge_ssts(&mut self, mut to_merge: Vec<SSTable>, target_level: u8) -> io::Result<()> {
+    fn merge_ssts(&self, mut to_merge: Vec<SSTable>, target_level: u8) -> io::Result<()> {
         // Since we want to keep the most recent value for a key, we need to reverse the list
         // to pick the most recent value for a key as manifest is ordered oldest to most recent.
         // See [`util::merge_sorted_uniq`].
@@ -259,7 +266,8 @@ impl<S: SSTableReader> LSMTree<S> {
 
         let merged = merge_sorted_uniq(sources).map(Into::<(String, Vec<u8>)>::into);
 
-        let mut txn = self.manifest_writer.transaction();
+        let mut writer = self.manifest_writer.lock().unwrap();
+        let mut txn = writer.transaction();
         txn.remove_sstables(to_merge.iter().map(|it| it.id).collect());
 
         let sst_id = txn.add_sstable(target_level, min_key, max_key);
@@ -307,17 +315,17 @@ impl<S: SSTableReader> Store for LSMTree<S> {
         LSMTree::get_range(self, range)
     }
 
-    fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+    fn insert(&self, key: &str, value: &[u8]) -> io::Result<()> {
         let mut entries = BTreeMap::new();
         entries.insert(key.to_owned(), value.to_owned());
         self.write_sstable(&entries)
     }
 
-    fn insert_batch(&mut self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+    fn insert_batch(&self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
         self.write_sstable(entries)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&self) -> io::Result<()> {
         // This store always writes to disk on insert, so we don't really need to flush here.
         Ok(())
     }

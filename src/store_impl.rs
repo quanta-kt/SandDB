@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use crate::lsm_tree::LSMTree;
 use crate::sstable::reader::{CachedSSTableReader, FsSSTReader};
@@ -13,17 +16,17 @@ const MAX_SIZE: usize = 512;
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024; // 64 KiB
 
 pub struct StoreImpl<L: Store> {
-    memtable_size: usize,
-    memtable: BTreeMap<String, Vec<u8>>,
+    memtable_size: AtomicUsize,
+    memtable: Mutex<BTreeMap<String, Vec<u8>>>,
     lsm_tree: L,
-    wal: Wal,
+    wal: Mutex<Wal>,
 }
 
 impl StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>> {
     pub fn open(
         directory: PathBuf,
     ) -> io::Result<StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>> {
-        let mut lsm_tree = LSMTree::new(directory.clone())?;
+        let lsm_tree = LSMTree::new(directory.clone())?;
         let mut wal = Wal::new(&directory)?;
 
         let batch = BTreeMap::from_iter(wal.restore()?);
@@ -42,23 +45,25 @@ impl StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>> {
 impl<L: Store> StoreImpl<L> {
     fn new(lsm_tree: L, wal: Wal) -> io::Result<StoreImpl<L>> {
         Ok(StoreImpl {
-            memtable_size: 0,
-            memtable: BTreeMap::new(),
+            memtable_size: AtomicUsize::new(0),
+            memtable: Mutex::new(BTreeMap::new()),
             lsm_tree,
-            wal,
+            wal: Mutex::new(wal),
         })
     }
 
-    fn flush_memtable(&mut self) -> io::Result<()> {
-        self.lsm_tree.insert_batch(&self.memtable)?;
-        self.memtable.clear();
-        self.memtable_size = 0;
-        self.wal.truncate()?;
+    fn flush_memtable(&self) -> io::Result<()> {
+        let mut memtable = self.memtable.lock().unwrap();
+
+        self.lsm_tree.insert_batch(&*memtable)?;
+        memtable.clear();
+        self.memtable_size.store(0, Ordering::Relaxed);
+        self.wal.lock().unwrap().truncate()?;
 
         Ok(())
     }
 
-    fn validate(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+    fn validate(&self, key: &str, value: &[u8]) -> io::Result<()> {
         if key.len() > MAX_SIZE {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Key too long"));
         }
@@ -73,17 +78,17 @@ impl<L: Store> StoreImpl<L> {
         return Ok(())
     }
 
-    fn maybe_flush_memtable(&mut self) -> io::Result<()> {
-        if self.memtable_size > MAX_MEMTABLE_SIZE {
+    fn maybe_flush_memtable(&self) -> io::Result<()> {
+        if self.memtable_size.load(Ordering::Relaxed) > MAX_MEMTABLE_SIZE {
             self.flush_memtable()?;
         }
 
         Ok(())
     }
 
-    fn add_to_memtable(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.memtable.insert(key.to_owned(), value.to_owned());
-        self.memtable_size += key.len() + value.len();
+    fn add_to_memtable(&self, key: &str, value: &[u8]) -> io::Result<()> {
+        self.memtable.lock().unwrap().insert(key.to_owned(), value.to_owned());
+        self.memtable_size.fetch_add(key.len() + value.len(), Ordering::Relaxed);
         self.maybe_flush_memtable()?;
 
         Ok(())
@@ -91,20 +96,20 @@ impl<L: Store> StoreImpl<L> {
 }
 
 impl<L: Store> Store for StoreImpl<L> {
-    fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+    fn insert(&self, key: &str, value: &[u8]) -> io::Result<()> {
         self.validate(key, value)?;
-        self.wal.log_one(key, value)?;
+        self.wal.lock().unwrap().log_one(key, value)?;
         self.add_to_memtable(key, value)?;
 
         Ok(())
     }
 
-    fn insert_batch(&mut self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+    fn insert_batch(&self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
         for (key, value) in entries {
             self.validate(key, value)?;
         }
 
-        self.wal.log_many(entries)?;
+        self.wal.lock().unwrap().log_many(entries)?;
 
         for (key, value) in entries.iter() {
             self.add_to_memtable(key, value)?;
@@ -114,7 +119,7 @@ impl<L: Store> Store for StoreImpl<L> {
     }
 
     fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        if let Some(value) = self.memtable.get(key) {
+        if let Some(value) = self.memtable.lock().unwrap().get(key) {
             return Ok(Some(value.to_owned()));
         }
 
@@ -127,9 +132,16 @@ impl<L: Store> Store for StoreImpl<L> {
     ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
         let memtable_iter = self
             .memtable
+            .lock()
+            .unwrap()
             .range(range.clone())
             .map(|(k, v)| (k.clone(), v.clone()))
-            .map(Into::<KeyOnlyOrd>::into);
+            .map(Into::<KeyOnlyOrd>::into)
+            // This is not a &mut method and we therefore can't just return an iterator
+            // that refrences memtable since a parallel writer may mutate that.
+            // We therefore copy the memtable into a Vec and make an iterator out of that.
+            .collect::<Vec<_>>()
+            .into_iter();
 
         let lsm_tree_iter = self
             .lsm_tree
@@ -145,8 +157,8 @@ impl<L: Store> Store for StoreImpl<L> {
         .map(Into::<(String, Vec<u8>)>::into))
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        if self.memtable.is_empty() {
+    fn flush(&self) -> io::Result<()> {
+        if self.memtable.lock().unwrap().is_empty() {
             return self.lsm_tree.flush();
         }
 
@@ -169,11 +181,11 @@ impl<L: Store> Drop for StoreImpl<L> {
 pub struct DefaultStore(StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>);
 
 impl Store for DefaultStore {
-    fn insert(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+    fn insert(&self, key: &str, value: &[u8]) -> io::Result<()> {
         self.0.insert(key, value)
     }
 
-    fn insert_batch(&mut self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+    fn insert_batch(&self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
         self.0.insert_batch(entries)
     }
 
@@ -188,7 +200,7 @@ impl Store for DefaultStore {
         self.0.get_range(range)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&self) -> io::Result<()> {
         self.0.flush()
     }
 }
@@ -212,7 +224,7 @@ mod tests {
 
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir).unwrap();
+        let store = make_store(dir).unwrap();
 
         let actual_value = vec![0, 1, 2];
 
@@ -232,12 +244,12 @@ mod tests {
 
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
 
         store.insert("hello", "world".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         let value = store.get("hello").unwrap();
         assert_eq!(value, Some("world".as_bytes().to_vec()));
     }
@@ -251,7 +263,7 @@ mod tests {
 
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
 
         for i in 0..1000 {
             store
@@ -264,7 +276,7 @@ mod tests {
 
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         for i in 0..1000 {
             let value = store.get(&format!("key_{:04}", i)).unwrap();
             assert_eq!(value, Some(format!("value_{:04}", i).as_bytes().to_vec()));
@@ -280,7 +292,7 @@ mod tests {
 
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
 
         for i in 0..5000 {
             store
@@ -293,7 +305,7 @@ mod tests {
 
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         for i in 0..5000 {
             let value = store.get(&format!("key_{:04}", i)).unwrap();
             assert_eq!(value, Some(format!("value_{:04}", i).as_bytes().to_vec()));
@@ -309,7 +321,7 @@ mod tests {
 
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
 
         let file_count = fs::read_dir(&dir).unwrap().count();
 
@@ -360,15 +372,15 @@ mod tests {
 
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo", "bar".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo", "baz".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         let value = store.get("foo").unwrap();
         assert!(value.is_some());
         assert_eq!(value, Some(b"baz".to_vec()));
@@ -380,7 +392,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo", "bar".as_bytes()).unwrap();
         store.insert("foo2", "bar2".as_bytes()).unwrap();
         store.insert("foo3", "bar3".as_bytes()).unwrap();
@@ -404,14 +416,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo", "bar".as_bytes()).unwrap();
         store.insert("foo2", "bar2".as_bytes()).unwrap();
 
         // Dropping the store flushes the memtable to the LSM tree
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
 
         // These keys should be in the memtable
         store.insert("foo3", "bar3".as_bytes()).unwrap();
@@ -436,25 +448,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("sst1:foo0", "bar0".as_bytes()).unwrap();
         store.insert("sst1:foo1", "bar1".as_bytes()).unwrap();
         store.insert("sst1:foo2", "bar2".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("sst2:foo0", "bar0".as_bytes()).unwrap();
         store.insert("sst2:foo1", "bar1".as_bytes()).unwrap();
         store.insert("sst2:foo2", "bar2".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("sst3:foo0", "bar0".as_bytes()).unwrap();
         store.insert("sst3:foo1", "bar1".as_bytes()).unwrap();
         store.insert("sst3:foo2", "bar2".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("memtable:foo0", "bar0".as_bytes()).unwrap();
         store.insert("memtable:foo1", "bar1".as_bytes()).unwrap();
         store.insert("memtable:foo2", "bar2".as_bytes()).unwrap();
@@ -491,11 +503,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo", b"bar").unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo", b"bar2").unwrap();
 
         let actual: Vec<_> = store.get_range(..).unwrap().collect();
@@ -509,22 +521,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo0", "wrong".as_bytes()).unwrap();
         store.insert("foo2", "right".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo0", "wrong2".as_bytes()).unwrap();
         store.insert("foo3", "wrong3".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo0", "right".as_bytes()).unwrap();
         store.insert("foo4", "right".as_bytes()).unwrap();
         drop(store);
 
-        let mut store = make_store(dir.clone()).unwrap();
+        let store = make_store(dir.clone()).unwrap();
         store.insert("foo3", "right".as_bytes()).unwrap();
 
         let actual: Vec<_> = store.get_range(..).unwrap().collect();
