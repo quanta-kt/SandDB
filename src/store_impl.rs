@@ -178,35 +178,10 @@ impl<L: Store> Drop for StoreImpl<L> {
     }
 }
 
-pub struct DefaultStore(StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>);
-
-impl Store for DefaultStore {
-    fn insert(&self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.0.insert(key, value)
-    }
-
-    fn insert_batch(&self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
-        self.0.insert_batch(entries)
-    }
-
-    fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        self.0.get(key)
-    }
-
-    fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
-        &'a self,
-        range: R,
-    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
-        self.0.get_range(range)
-    }
-
-    fn flush(&self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
+pub type DefaultStore = StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>>;
 
 pub fn make_store(directory: PathBuf) -> io::Result<DefaultStore> {
-    Ok(DefaultStore(StoreImpl::open(directory.clone())?))
+    Ok(StoreImpl::open(directory.clone())?)
 }
 
 #[cfg(test)]
