@@ -28,6 +28,11 @@ fn main() -> io::Result<()> {
 
         let mut cmd = String::new();
         stdin().read_line(&mut cmd)?;
+
+        if cmd.is_empty() {
+            return Ok(());
+        }
+
         let cmd = cmd.trim();
 
         if cmd.is_empty() {
