@@ -1,4 +1,5 @@
 use std::io::{self, Write, stdin};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use sand_db::{Store, make_store};
@@ -22,9 +23,14 @@ fn main() -> io::Result<()> {
         }
     };
 
+    let is_tty = stdin().is_terminal();
+
     loop {
-        print!("> ");
-        std::io::stdout().flush()?;
+        if is_tty {
+            eprint!("> ");
+        }
+
+        std::io::stderr().flush()?;
 
         let mut cmd = String::new();
         stdin().read_line(&mut cmd)?;
