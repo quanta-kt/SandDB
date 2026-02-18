@@ -35,6 +35,9 @@ pub struct LSMTree<S: SSTableReader> {
     manifest_writer: Mutex<ManifestWriter>,
     sstable_reader: S,
 
+    // Number of level-0 SSTables.
+    // This is updated everytime we read manifest and
+    // may be 0 if we haven't read it yet.
     level_zero_count: AtomicU8,
 }
 
@@ -193,7 +196,12 @@ impl<S: SSTableReader> LSMTree<S> {
     }
 
     pub fn compact(&self) -> io::Result<()> {
-        if self.level_zero_count.load(Ordering::Relaxed) < COMPACT_EVERY_N_SSTABLES {
+        let diff = COMPACT_EVERY_N_SSTABLES.saturating_sub(self.level_zero_count.load(Ordering::Relaxed));
+
+        // level_zero_count == 0 might mean we haven't read the count off manifest yet.
+        // We therefore proceed with compaction in that case.
+        // If compaction will cancel itself if there are actually no level 0 SSTs.
+        if (1..COMPACT_EVERY_N_SSTABLES - 1).contains(&diff) {
             return Ok(());
         }
 
@@ -374,6 +382,51 @@ mod tests {
 
             if let Some(sstables) = sstables {
                 assert!(sstables.len() <= COMPACT_EVERY_N_SSTABLES as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn test_writing_n_sstables_across_runs_compacts() {
+        let filename = "test_writing_n_sstables_across_runs_compacts";
+
+        if PathBuf::from(filename).exists() {
+            fs::remove_dir_all(filename).unwrap();
+        }
+
+        for i in 0..COMPACT_EVERY_N_SSTABLES + 1 {
+            for j in 0..COMPACT_EVERY_N_SSTABLES + 1 {
+                let tree = LSMTree::new(PathBuf::from(filename)).unwrap();
+
+                tree.write_sstable(&BTreeMap::from([(
+                    format!("key_{}_{}", i, j),
+                    format!("value_{}_{}", i, j).as_bytes().to_vec(),
+                )]))
+                .unwrap();
+            }
+
+            let manifest_reader =
+                ManifestReader::new(File::open(PathBuf::from(filename).join("manifest")).unwrap());
+            let sstables = manifest_reader.read().unwrap();
+
+            // group by levels
+            let mut levels = BTreeMap::new();
+
+            for sstable in sstables.sstables {
+                levels
+                    .entry(sstable.level)
+                    .or_insert(Vec::new())
+                    .push(sstable);
+            }
+
+            assert!(levels.len() <= MAX_LEVEL as usize);
+
+            for level in 0..=MAX_LEVEL {
+                let sstables = levels.get(&level);
+
+                if let Some(sstables) = sstables {
+                    assert!(sstables.len() <= COMPACT_EVERY_N_SSTABLES as usize);
+                }
             }
         }
     }
