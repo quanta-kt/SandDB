@@ -14,12 +14,10 @@ use fs2::FileExt;
 use crate::{
     Store,
     manifest::{Manifest, ManifestReader, ManifestWriter, SSTable},
-    sstable::{
-        SSTableWriter,
-        reader::{CachedSSTableReader, FsSSTReader, SSTableReader},
-    },
+    sstable::reader::{CachedSSTableReader, FsSSTReader, SSTableReader},
     util::{KeyOnlyOrd, merge_sorted_uniq},
 };
+use crate::sstable::writer::SSTableWriter;
 
 const DB_LOCK_FILENAME: &str = ".lock";
 
@@ -179,14 +177,11 @@ impl<S: SSTableReader> LSMTree<S> {
         let mut txn = writer.transaction();
         let id = txn.add_sstable(0, min_key, max_key);
 
-        SSTableWriter::write_sstable(
-            self.directory.clone(),
-            id,
-            &mut source
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_slice()))
-                .peekable(),
-        )?;
+        let mut writer = SSTableWriter::open(&self.directory, id)?;
+        for (key, value) in source.iter() {
+            writer.write(key, value)?;
+        }
+        writer.finalize()?;
 
         txn.commit()?;
 
@@ -280,9 +275,12 @@ impl<S: SSTableReader> LSMTree<S> {
 
         let sst_id = txn.add_sstable(target_level, min_key, max_key);
 
-        let writer = SSTableWriter::new(File::create(sst_file_path(&self.directory, sst_id))?);
+        let mut writer = SSTableWriter::open(&self.directory, sst_id)?;
+        for (key, value) in merged {
+            writer.write(key, value)?;
+        }
+        writer.finalize()?;
 
-        writer.write(&mut merged.peekable());
         txn.commit()?;
 
         for table in to_merge.iter() {

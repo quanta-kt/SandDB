@@ -1,173 +1,193 @@
-use crate::io_ext::WriteExt;
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
-use std::iter::Peekable;
-use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::io;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::mem;
+use std::path::Path;
 
-use super::{ChunkDesc, DEFAULT_PAGE_SIZE, MAGIC, VERSION, sst_file_path};
+use crate::io_ext::WriteExt;
 
-pub struct SSTableWriter<F, K, V>
-where
-    F: Write + Seek,
-    K: AsRef<str>,
-    V: AsRef<[u8]>,
-{
-    file: F,
-    _k: PhantomData<K>,
-    _v: PhantomData<V>,
+use super::DEFAULT_PAGE_SIZE;
+use super::MAGIC;
+use super::VERSION;
+use super::ChunkDesc;
+use super::sst_file_path;
+
+pub struct SSTableWriter {
+    file: Option<File>,
+
+    chunks: Vec<ChunkDesc>,
+    curr_chunk_written: usize,
+    curr_chunk_count: u32,
 }
 
-impl<K, V> SSTableWriter<File, K, V>
-where
-    K: AsRef<str>,
-    V: AsRef<[u8]>,
-{
-    pub fn write_sstable(
-        directory: PathBuf,
-        sst_id: u64,
-        source: &mut Peekable<impl Iterator<Item = (K, V)>>,
-    ) -> io::Result<()>
+impl SSTableWriter {
+    pub fn open(
+        directory: &Path,
+        sst_id: u64
+    ) -> io::Result<Self> {
+        let file_path = sst_file_path(&directory, sst_id);
+        let file = File::create(file_path)?;
+
+        SSTableWriter::new(file)
+    }
+
+    fn new(mut file: File) -> io::Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut ret = SSTableWriter {
+            file: Some(file),
+            chunks: Vec::new(),
+            curr_chunk_written: 0,
+            curr_chunk_count: 0,
+        };
+
+        ret.write_header()?;
+        ret.start_chunk()?;
+
+        Ok(ret)
+    }
+
+    pub fn write<K, V>(&mut self, key: K, value: V) -> io::Result<()>
     where
         K: AsRef<str>,
         V: AsRef<[u8]>,
     {
-        let file_path = sst_file_path(&directory, sst_id);
-        let mut file = File::create(file_path)?;
 
-        let writer = SSTableWriter::new(&file);
-        writer.write(source);
 
-        file.flush()?;
+        let key = key.as_ref();
+        let value = value.as_ref();
+
+        let entry_size = key.len() + value.len() + 16;
+
+        if self.curr_chunk_written + entry_size > DEFAULT_PAGE_SIZE {
+            self.end_chunk()?;
+            self.start_chunk()?;
+        }
+
+        let file = self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finalized."))?;
+
+        let index = self.chunks.len() - 1;
+        let curr = &mut self.chunks[index];
+
+        file.write_string(key).unwrap();
+        file.write_bytes(value).unwrap();
+
+        if key > &curr.max_key {
+            curr.max_key = key.to_string();
+        }
+
+        if self.curr_chunk_written == 0 {
+            // If this is the first item we are writing for this chunk,
+            // it is also the min key for it.
+            curr.min_key = key.to_string();
+        }
+
+        self.curr_chunk_written += entry_size;
+        self.curr_chunk_count += 1;
+
+        Ok(())
+    }
+
+    pub fn finalize(&mut self) -> io::Result<()> {
+        self.end_chunk()?;
+
+        let mut file = mem::take(&mut self.file)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finalized."))?;
+
+        let chunk_dir_pos = file.seek(SeekFrom::Current(0))?;
+        self.write_chunk_directory(&mut file)?;
+        self.write_footer(&mut file, chunk_dir_pos)?;
+
         file.sync_all()?;
+
+        Ok(())
+    }
+
+    fn end_chunk(&mut self) -> io::Result<()> {
+        let file = self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finalized."))?;
+
+        let chunk = &self.chunks[self.chunks.len() - 1];
+        let old_pos = file.seek(SeekFrom::Current(0))?;
+        file.seek(SeekFrom::Start(chunk.pos))?;
+
+
+        file.write_u32(self.curr_chunk_count)?;
+
+        // TODO: Compress the chunk
+        // FIXME: this field does not really reflect the true size of the block
+        // and instead is only an indicator of the sum all the key and value lengths.
+        // i.o.w it does not account for things like lengths that encode prefix.
+        file.write_u64(self.curr_chunk_written as u64).unwrap();
+        file.write_u64(self.curr_chunk_written as u64).unwrap();
+
+        file.seek(SeekFrom::Start(old_pos))?;
+
+        Ok(())
+    }
+
+    fn start_chunk(&mut self) -> io::Result<()> {
+        let file = self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finalized."))?;
+
+        let chunk_pos = file.seek(SeekFrom::Current(0))?;
+        self.chunks.push(ChunkDesc {
+            index: self.chunks.len(),
+            min_key: "".to_string(),
+            max_key: "".to_string(),
+            pos: chunk_pos
+        });
+
+        // Reserve space for the chunk header
+        file.write_u32(0)?;
+        file.write_u64(0)?;
+        file.write_u64(0)?;
+
+        self.curr_chunk_written = 0;
+        self.curr_chunk_count = 0;
+
+        Ok(())
+    }
+
+    fn write_header(&mut self) -> io::Result<()> {
+        let file = self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finalized."))?;
+
+        file.write_u32(MAGIC)?;
+        file.write_u8(VERSION)?;
+        file.write_u32(DEFAULT_PAGE_SIZE as u32)?;
+        Ok(())
+    }
+
+    fn write_footer(&mut self, file: &mut File, chunk_dir_pos: u64) -> io::Result<()>{
+        file.write_u64(chunk_dir_pos)?;
+        file.write_u32(self.chunks.len() as u32)?;
+        Ok(())
+    }
+
+    fn write_chunk_directory(&mut self, file: &mut File) -> io::Result<()> {
+        for chunk_desc in self.chunks.iter() {
+            file.write_u64(chunk_desc.pos)?;
+            file.write_string(&chunk_desc.min_key)?;
+            file.write_string(&chunk_desc.max_key)?;
+        }
 
         Ok(())
     }
 }
 
-impl<F, K, V> SSTableWriter<F, K, V>
-where
-    F: Write + Seek,
-    K: AsRef<str>,
-    V: AsRef<[u8]>,
-{
-    pub fn new(file: F) -> Self {
-        SSTableWriter {
-            file,
-            _k: PhantomData,
-            _v: PhantomData,
-        }
-    }
-
-    pub fn write<S>(mut self, source: &mut Peekable<S>)
-    where
-        S: Iterator<Item = (K, V)>,
-    {
-        self.write_header();
-
-        let chunks = self.write_chunks(source);
-        let chunk_count = chunks.len() as u32;
-
-        let chunk_dir_pos = self.file.stream_position().unwrap();
-        self.write_chunk_directory(chunks);
-
-        self.write_footer(chunk_dir_pos, chunk_count);
-    }
-
-    fn write_header(&mut self) {
-        self.file.write_u32(MAGIC).unwrap();
-        self.file.write_u8(VERSION).unwrap();
-        self.file.write_u32(DEFAULT_PAGE_SIZE as u32).unwrap();
-    }
-
-    fn write_footer(&mut self, chunk_dir_pos: u64, chunk_count: u32) {
-        self.file.write_u64(chunk_dir_pos).unwrap();
-        self.file.write_u32(chunk_count).unwrap();
-    }
-
-    fn write_chunk_directory(&mut self, chunk_descs: Vec<ChunkDesc>) {
-        for chunk_desc in chunk_descs {
-            self.file.write_u64(chunk_desc.pos).unwrap();
-            self.file.write_string(&chunk_desc.min_key).unwrap();
-            self.file.write_string(&chunk_desc.max_key).unwrap();
-        }
-    }
-
-    fn write_chunks<S>(&mut self, source: &mut Peekable<S>) -> Vec<ChunkDesc>
-    where
-        S: Iterator<Item = (K, V)>,
-    {
-        let mut chunk_descs = Vec::new();
-
-        let mut index = 0;
-
-        while source.peek().is_some() {
-            chunk_descs.push(self.write_chunk(index, source));
-            index += 1;
-        }
-
-        chunk_descs
-    }
-
-    fn write_chunk<S>(&mut self, index: usize, source: &mut Peekable<S>) -> ChunkDesc
-    where
-        S: Iterator<Item = (K, V)>,
-    {
-        const HEADER_SIZE: usize = 20;
-
-        let pos = self.file.stream_position().unwrap();
-
-        let min_key = source.peek().unwrap().0.as_ref().to_owned();
-        let mut max_key = min_key.to_owned();
-
-        // Reserve space for the chunk header
-        self.file.write_u32(0).unwrap();
-        self.file.write_u64(0).unwrap();
-        self.file.write_u64(0).unwrap();
-
-        let mut written: usize = HEADER_SIZE;
-        let mut item_count: u32 = 0;
-
-        while let Some((key, value)) = source.peek() {
-            let key = key.as_ref();
-            let value = value.as_ref();
-
-            let entry_size = key.len() + value.len() + 16;
-
-            if written + entry_size > DEFAULT_PAGE_SIZE {
-                break;
-            }
-
-            self.file.write_string(key).unwrap();
-            self.file.write_bytes(value).unwrap();
-
-            if key > &max_key {
-                max_key = key.to_string();
-            }
-
-            written += entry_size;
-            item_count += 1;
-
-            source.next();
-        }
-
-        // Write the chunk header
-        let end_pos = self.file.stream_position().unwrap();
-        self.file.seek(SeekFrom::Start(pos)).unwrap();
-        self.file.write_u32(item_count).unwrap();
-
-        // TODO: Compress the chunk
-        self.file.write_u64(written as u64).unwrap();
-        self.file.write_u64(written as u64).unwrap();
-
-        // Seek back to the end of the chunk
-        self.file.seek(SeekFrom::Start(end_pos)).unwrap();
-
-        ChunkDesc {
-            index,
-            pos,
-            min_key: min_key.to_owned(),
-            max_key: max_key.to_owned(),
+impl Drop for SSTableWriter {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            eprintln!("BUG: SSTableWriter dropped without finalize()");
+            let _ = self.finalize();
         }
     }
 }
+
