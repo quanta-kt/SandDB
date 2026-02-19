@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::RangeBounds;
 
+pub trait Cursor: Iterator<Item = io::Result<(String, Vec<u8>)>> {}
+impl<I: Iterator<Item = io::Result<(String, Vec<u8>)>>> Cursor for I {}
+
 pub trait Store {
     fn insert(&self, key: &str, value: &[u8]) -> io::Result<()>;
 
@@ -12,7 +15,7 @@ pub trait Store {
     fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
         &'a self,
         range: R,
-    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a>;
+    ) -> io::Result<impl Cursor + 'a>;
 
     fn flush(&self) -> io::Result<()>;
 }

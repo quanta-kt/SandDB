@@ -15,9 +15,10 @@ use crate::{
     Store,
     manifest::{Manifest, ManifestReader, ManifestWriter, SSTable},
     sstable::reader::{CachedSSTableReader, FsSSTReader, SSTableReader},
-    util::{KeyOnlyOrd, merge_sorted_uniq},
 };
 use crate::sstable::writer::SSTableWriter;
+use crate::store::Cursor;
+use crate::util::merge_sorted_uniq_cursor;
 
 const DB_LOCK_FILENAME: &str = ".lock";
 
@@ -96,15 +97,13 @@ impl<S: SSTableReader> LSMTree<S> {
         for candidate in candidate_ssts.iter().rev() {
             let candidate_chunks = self
                 .sstable_reader
-                .get_candidate_chunks_for_key(candidate.id, key);
+                .get_candidate_chunks_for_key(candidate.id, key)?;
 
             for chunk in candidate_chunks {
-                let chunk_data = self.sstable_reader.read_chunk(candidate.id, chunk.index);
+                let chunk_data = self.sstable_reader.read_chunk(candidate.id, chunk.index)?;
 
-                if let Some(chunk_data) = chunk_data {
-                    if let Ok(value) = chunk_data.binary_search_by_key(&key, |(k, _)| k) {
-                        return Ok(Some(chunk_data[value].1.clone()));
-                    }
+                if let Ok(value) = chunk_data.binary_search_by_key(&key, |(k, _)| k) {
+                    return Ok(Some(chunk_data[value].1.clone()));
                 }
             }
         }
@@ -115,7 +114,7 @@ impl<S: SSTableReader> LSMTree<S> {
     pub fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
         &'a self,
         range: R,
-    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
+    ) -> io::Result<impl Cursor + 'a> {
         let mut candidate_ssts = self
             .manifest_reader()
             .get_candidate_sstables_for_range(range.clone())?;
@@ -124,38 +123,41 @@ impl<S: SSTableReader> LSMTree<S> {
         // to pick the most recent entries during the merge.
         candidate_ssts.reverse();
 
-        let iter = candidate_ssts
-            .into_iter()
-            .map(move |candidate| {
-                let candidate_id = candidate.id;
+        let mut iters = Vec::with_capacity(candidate_ssts.len());
 
-                let candidate_chunks: Vec<_> = self
-                    .sstable_reader
-                    .get_candidate_chunks_for_range(candidate_id, range.clone())
-                    .into_iter()
-                    .collect();
+        for candidate in candidate_ssts {
+            let candidate_id = candidate.id;
 
+            let candidate_chunks = self
+                .sstable_reader
+                .get_candidate_chunks_for_range(candidate_id, range.clone())?
+                .into_iter();
+
+            let range = range.clone();
+
+            iters.push(candidate_chunks.flat_map(move |chunk_desc| {
                 let range = range.clone();
 
-                candidate_chunks
-                    .into_iter()
-                    .flat_map(move |chunk| {
-                        let range = range.clone();
+                // FIXME: Evaluate if it should be OK to cache range queries.
+                // especially when they are large. I suspect this could pollute
+                // the cache with pages that might never be used again.
+                let chunk = self.sstable_reader
+                    .read_chunk(candidate_id, chunk_desc.index);
 
-                        // FIXME: Evaluate if it should be OK to cache range queries.
-                        // especially when they are large. I suspect this could pollute
-                        // the cache with pages that might never be used again.
-                        self.sstable_reader
-                            .read_chunk(candidate_id, chunk.index)
-                            .into_iter()
-                            .flatten()
+                let iter: Box<dyn Cursor> = match chunk {
+                    Ok(chunk) =>
+                        Box::new(chunk.into_iter()
                             .filter(move |(key, _)| range.contains(key.as_str()))
-                    })
-                    .map(Into::<KeyOnlyOrd>::into)
-            })
-            .collect::<Vec<_>>();
+                            .map(Ok)),
 
-        Ok(merge_sorted_uniq(iter).map(Into::<(String, Vec<u8>)>::into))
+                    Err(e) => Box::new(std::iter::once(Err(e))),
+                };
+
+                iter
+            }))
+        }
+
+        Ok(merge_sorted_uniq_cursor(iters))
     }
 
     pub fn write_sstable(&self, source: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
@@ -255,32 +257,34 @@ impl<S: SSTableReader> LSMTree<S> {
             // SAFETY: we know that there are at least 3 sstables
             .unwrap();
 
-        let sources = to_merge
-            .iter()
-            .map(|table| {
-                let reader = FsSSTReader::new(self.directory.clone());
-                reader
-                    .chunk_iterator(table.id)
-                    .flatten()
-                    // Order and de-dup based only on the key
-                    .map(Into::<KeyOnlyOrd>::into)
-            })
-            .collect::<Vec<_>>();
+        let mut sources = Vec::with_capacity(to_merge.len());
 
-        let merged = merge_sorted_uniq(sources).map(Into::<(String, Vec<u8>)>::into);
+        for table in to_merge.iter() {
+            let reader = FsSSTReader::new(self.directory.clone());
+            let iter = reader.chunk_iterator(table.id)?;
+
+            let flattened = iter.flat_map(|chunk| {
+                chunk.map(|chunk| Box::new(chunk.into_iter().map(Ok)) as Box<dyn Cursor>)
+                    .unwrap_or_else(|e| Box::new(std::iter::once(Err(e))) as Box<dyn Cursor>)
+            });
+
+            sources.push(flattened);
+        }
+
+        let merged = merge_sorted_uniq_cursor(sources);
 
         let mut writer = self.manifest_writer.lock().unwrap();
         let mut txn = writer.transaction();
         txn.remove_sstables(to_merge.iter().map(|it| it.id).collect());
 
-        let sst_id = txn.add_sstable(target_level, min_key, max_key);
+        let sst_id = txn.add_sstable(target_level, &min_key, max_key);
 
         let mut writer = SSTableWriter::open(&self.directory, sst_id)?;
-        for (key, value) in merged {
+        for item in merged {
+            let (key, value) = item?;
             writer.write(key, value)?;
         }
         writer.finalize()?;
-
         txn.commit()?;
 
         for table in to_merge.iter() {
@@ -317,7 +321,7 @@ impl<S: SSTableReader> Store for LSMTree<S> {
     fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
         &'a self,
         range: R,
-    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
+    ) -> io::Result<impl Cursor + 'a> {
         LSMTree::get_range(self, range)
     }
 

@@ -11,8 +11,6 @@ pub mod writer;
 
 use std::path::{Path, PathBuf};
 
-pub use writer::SSTableWriter;
-
 #[derive(Debug, Clone)]
 pub struct ChunkDesc {
     pub index: usize,

@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use crate::lsm_tree::LSMTree;
 use crate::sstable::reader::{CachedSSTableReader, FsSSTReader};
 use crate::store::Store;
-use crate::util::{KeyOnlyOrd, merge_sorted_uniq};
+use crate::store::Cursor;
+use crate::util::merge_sorted_uniq_cursor;
 use crate::wal::Wal;
 
 const MAX_SIZE: usize = 512;
@@ -129,14 +130,14 @@ impl<L: Store> Store for StoreImpl<L> {
     fn get_range<'a, R: RangeBounds<str> + Clone + 'a>(
         &'a self,
         range: R,
-    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)> + 'a> {
+    ) -> io::Result<impl Cursor + 'a> {
         let memtable_iter = self
             .memtable
             .lock()
             .unwrap()
             .range(range.clone())
             .map(|(k, v)| (k.clone(), v.clone()))
-            .map(Into::<KeyOnlyOrd>::into)
+            .map(Ok)
             // This is not a &mut method and we therefore can't just return an iterator
             // that refrences memtable since a parallel writer may mutate that.
             // We therefore copy the memtable into a Vec and make an iterator out of that.
@@ -145,16 +146,14 @@ impl<L: Store> Store for StoreImpl<L> {
 
         let lsm_tree_iter = self
             .lsm_tree
-            .get_range(range)?
-            .map(Into::<KeyOnlyOrd>::into);
+            .get_range(range)?;
 
-        Ok(merge_sorted_uniq(vec![
+        Ok(merge_sorted_uniq_cursor(vec![
             // Since these are entirely different types, we need to box them,
             // monomorphization is not possible. Put them behind a trait object.
-            Box::new(memtable_iter) as Box<dyn Iterator<Item = _>>,
-            Box::new(lsm_tree_iter) as Box<dyn Iterator<Item = _>>,
-        ])
-        .map(Into::<(String, Vec<u8>)>::into))
+            (Box::new(memtable_iter) as Box<dyn Cursor>),
+            (Box::new(lsm_tree_iter) as Box<dyn Cursor>),
+        ]))
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -373,7 +372,7 @@ mod tests {
         store.insert("foo3", "bar3".as_bytes()).unwrap();
 
         let iter = store.get_range(..).unwrap();
-        let values = iter.collect::<Vec<_>>();
+        let values = iter.map(Result::unwrap).collect::<Vec<_>>();
 
         assert_eq!(
             values,
@@ -404,7 +403,7 @@ mod tests {
         store.insert("foo3", "bar3".as_bytes()).unwrap();
         store.insert("foo4", "bar4".as_bytes()).unwrap();
 
-        let actual: Vec<_> = store.get_range(..).unwrap().collect();
+        let actual: Vec<_> = store.get_range(..).unwrap().map(Result::unwrap).collect();
 
         assert_eq!(
             actual,
@@ -450,7 +449,7 @@ mod tests {
         drop(store);
 
         let store = make_store(dir.clone()).unwrap();
-        let actual: Vec<_> = store.get_range(..).unwrap().collect();
+        let actual: Vec<_> = store.get_range(..).unwrap().map(Result::unwrap).collect();
 
         assert_eq!(
             actual,
@@ -485,7 +484,7 @@ mod tests {
         let store = make_store(dir.clone()).unwrap();
         store.insert("foo", b"bar2").unwrap();
 
-        let actual: Vec<_> = store.get_range(..).unwrap().collect();
+        let actual: Vec<_> = store.get_range(..).unwrap().map(Result::unwrap).collect();
 
         assert_eq!(actual, vec![("foo".to_string(), b"bar2".to_vec())]);
     }
@@ -514,7 +513,7 @@ mod tests {
         let store = make_store(dir.clone()).unwrap();
         store.insert("foo3", "right".as_bytes()).unwrap();
 
-        let actual: Vec<_> = store.get_range(..).unwrap().collect();
+        let actual: Vec<_> = store.get_range(..).unwrap().map(Result::unwrap).collect();
 
         assert_eq!(
             actual,

@@ -98,7 +98,8 @@ fn main() -> io::Result<()> {
             "list" => {
                 match store.get_range(..) {
                     Ok(iter) => {
-                        for (key, value) in iter {
+                        for item in iter {
+                            let (key, value) = item?;
                             let escaped: Vec<u8> = value.iter()
                                 .map(|it| std::ascii::escape_default(*it))
                                 .flatten()

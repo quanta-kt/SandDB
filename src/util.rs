@@ -1,27 +1,11 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
+use crate::store::Cursor;
+
 /// A wrapper around a key-value pair that implements Ord, PartialOrd, Eq, and PartialEq
 /// based only on the key.
-pub struct KeyOnlyOrd((String, Vec<u8>));
-
-impl KeyOnlyOrd {
-    pub fn new(key: String, value: Vec<u8>) -> Self {
-        Self((key, value))
-    }
-}
-
-impl From<(String, Vec<u8>)> for KeyOnlyOrd {
-    fn from(value: (String, Vec<u8>)) -> Self {
-        Self(value)
-    }
-}
-
-impl From<KeyOnlyOrd> for (String, Vec<u8>) {
-    fn from(value: KeyOnlyOrd) -> Self {
-        value.0
-    }
-}
+struct KeyOnlyOrd((String, Vec<u8>));
 
 impl PartialOrd for KeyOnlyOrd {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -58,27 +42,47 @@ impl Eq for KeyOnlyOrd {}
 ///
 /// assert_eq!(merged.collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
 /// ```
-pub(crate) fn merge_sorted_uniq<I>(mut sources: Vec<I>) -> impl Iterator<Item = I::Item>
+pub(crate) fn merge_sorted_uniq_cursor<I>(mut sources: Vec<I>) -> impl Cursor 
 where
-    I: Iterator,
-    I::Item: Ord,
+    I: Cursor
 {
     let mut heap = BinaryHeap::new();
+    let mut error = None;
+    let mut last: Option<KeyOnlyOrd> = None;
+    let mut end = false;
 
     for (idx, source) in sources.iter_mut().enumerate() {
-        if let Some(item) = source.next() {
-            heap.push(Reverse((item, idx)));
+        match source.next() {
+            Some(Ok(item)) => {
+                heap.push(Reverse((KeyOnlyOrd(item), idx)))
+            },
+            Some(Err(e)) => {
+                error = Some(e)
+            },
+            None => {},
         }
     }
 
-    let mut last: Option<I::Item> = None;
-
     std::iter::from_fn(move || {
+        if end {
+            return None;
+        }
+
+        if let Some(error) = error.take() {
+            end = true;
+            return Some(Err(error));
+        };
+
         while let Some(Reverse((item, idx))) = heap.pop() {
             let next: Option<I::Item> = sources[idx].next();
 
-            if let Some(next) = next {
-                heap.push(Reverse((next, idx)));
+            match next {
+                Some(Ok(next)) => heap.push(Reverse((KeyOnlyOrd(next), idx))),
+                Some(e) => {
+                    end = true;
+                    return Some(e);
+                }
+                None => {},
             }
 
             if last.as_ref() == Some(&item) {
@@ -87,13 +91,13 @@ where
 
             match last.replace(item) {
                 None => continue,
-                Some(prev) => {
-                    return Some(prev);
+                Some(KeyOnlyOrd(prev)) => {
+                    return Some(Ok(prev));
                 }
             }
         }
 
-        last.take()
+        last.take().map(|KeyOnlyOrd(it)| Ok(it))
     })
 }
 
@@ -101,29 +105,34 @@ where
 mod tests {
     use super::*;
 
+    fn p(n: i32) -> (String, Vec<u8>) {
+        (format!("p{}", n), b"".to_vec())
+    }
+
     #[test]
     fn test_merge_sorted() {
-        let v1 = vec![1, 4, 7];
-        let v2 = vec![2, 5, 8];
-        let v3 = vec![2, 3, 6, 9];
 
-        let merged = merge_sorted_uniq(vec![v1.into_iter(), v2.into_iter(), v3.into_iter()]);
+        let v1 = vec![Ok(p(1)), Ok(p(4)), Ok(p(7))];
+        let v2 = vec![Ok(p(2)), Ok(p(5)), Ok(p(8))];
+        let v3 = vec![Ok(p(2)), Ok(p(3)), Ok(p(6)), Ok(p(9))];
 
-        assert_eq!(merged.collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let merged: Vec<_> = merge_sorted_uniq_cursor(vec![v1.into_iter(), v2.into_iter(), v3.into_iter()])
+            .map(|it| it.unwrap())
+            .collect();
+
+        assert_eq!(merged, vec![p(1), p(2), p(3), p(4), p(5), p(6), p(7), p(8), p(9)]);
     }
 
     #[test]
     fn test_duplicates_are_dropped() {
-        let v1 = vec![("foo".to_owned(), b"bar".to_vec())]
-            .into_iter()
-            .map(Into::<KeyOnlyOrd>::into);
+        let v1 = vec![Ok(("foo".to_owned(), b"bar".to_vec()))]
+            .into_iter();
 
-        let v2 = vec![("foo".to_owned(), b"bar2".to_vec())]
-            .into_iter()
-            .map(Into::<KeyOnlyOrd>::into);
+        let v2 = vec![Ok(("foo".to_owned(), b"bar2".to_vec()))]
+            .into_iter();
 
-        let merged: Vec<_> = merge_sorted_uniq(vec![v2, v1])
-            .map(Into::<(String, Vec<u8>)>::into)
+        let merged: Vec<_> = merge_sorted_uniq_cursor(vec![v2, v1])
+            .map(|it| it.unwrap())
             .collect();
 
         assert_eq!(merged, vec![("foo".to_owned(), b"bar2".to_vec())]);
