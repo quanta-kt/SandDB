@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
 };
 use std::sync::Mutex;
+use std::ops::Bound::*;
 
 use super::{ChunkDesc, sst_file_path};
 
@@ -31,10 +32,55 @@ pub trait SSTableReader {
         sst_id: u64,
         range: Range,
     ) -> io::Result<Vec<ChunkDesc>> {
+        let is_empty = match (range.start_bound(), range.end_bound()) {
+            (Included(min), Included(max)) => min > max,
+            (Included(min), Excluded(max)) => min >= max,
+            (Excluded(min), Included(max)) => min >= max,
+            (Excluded(min), Excluded(max)) => min >= max,
+            _ => false,
+        };
+
+        if is_empty {
+            return Ok(vec![]);
+        }
+
         let chunks = self.list_chunks(sst_id)?;
         Ok(chunks
             .into_iter()
-            .filter(move |chunk| range.contains(&chunk.min_key) || range.contains(&chunk.max_key))
+            // Since chunks in SSTs are always sorted by their ranges (which are non-overlapping),
+            // we can fist skip the chunks that don't fall in the given range and then take the
+            // ones that do and drop everything that comes after. With this, we don't have to
+            // check all the chunks.
+            .skip_while(|chunk| {
+                let min_matches = match range.start_bound() {
+                    Included(x) => x <= chunk.max_key.as_str(),
+                    Excluded(x) => x < chunk.max_key.as_str(),
+                    Unbounded => true,
+                };
+
+                let max_matches = match range.end_bound() {
+                    Included(x) => x >= chunk.min_key.as_str(),
+                    Excluded(x) => x > chunk.min_key.as_str(),
+                    Unbounded => true,
+                };
+
+                !min_matches || !max_matches
+            })
+            .take_while(|chunk| {
+                let min_matches = match range.start_bound() {
+                    Included(x) => x <= chunk.max_key.as_str(),
+                    Excluded(x) => x < chunk.max_key.as_str(),
+                    Unbounded => true,
+                };
+
+                let max_matches = match range.end_bound() {
+                    Included(x) => x >= chunk.min_key.as_str(),
+                    Excluded(x) => x > chunk.min_key.as_str(),
+                    Unbounded => true,
+                };
+
+                min_matches && max_matches
+            })
             .collect())
     }
 }
@@ -279,3 +325,98 @@ impl Iterator for SSTChunkIterator {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use std::ops::Bound;
+
+    #[test]
+    fn test_retrive_candidate_chunks_in_range() {
+        struct MockReader(Vec<ChunkDesc>);
+
+        fn make_desc(index: usize, min: &str, max: &str) -> ChunkDesc {
+            ChunkDesc {
+                index,
+                pos: 0,
+                min_key: min.to_owned(),
+                max_key: max.to_owned(),
+            }
+        }
+
+        impl SSTableReader for MockReader {
+            type ChunkIterator = SSTChunkIterator;
+
+            fn list_chunks(&self, sst_id: u64) -> io::Result<Vec<ChunkDesc>> {
+                if sst_id != 0 {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "no such SST"));
+                }
+
+                Ok(self.0.clone())
+            }
+
+            fn read_chunk(&self, _: u64, _: usize) -> io::Result<Vec<(String, Vec<u8>)>> {
+                unimplemented!()
+            }
+
+            fn chunk_iterator(&self, _: u64) -> io::Result<Self::ChunkIterator> {
+                unimplemented!()
+            }
+        }
+
+        let reader = MockReader(
+            vec![
+                make_desc(0, "key10", "key20"),
+                make_desc(1, "key20", "key30"),
+                make_desc(2, "key30", "key40"),
+                make_desc(3, "key50", "key60"),
+            ]
+        );
+
+        let get_candidates = |range: (Bound<&str>, Bound<&str>)| {
+            reader.get_candidate_chunks_for_range(0, range)
+                .unwrap()
+                .iter()
+                .map(|it| it.index)
+                .collect::<Vec<_>>()
+        };
+
+        // empty
+        assert_eq!(get_candidates((Excluded("key15"), Excluded("key15"))), vec![]);
+        assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
+        assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
+
+        // single
+        assert_eq!(get_candidates((Included("key15"), Excluded("key17"))), vec![0]);
+        assert_eq!(get_candidates((Excluded("key15"), Included("key17"))), vec![0]);
+        assert_eq!(get_candidates((Included("key15"), Included("key15"))), vec![0]);
+
+        // out of range
+        assert_eq!(get_candidates((Excluded("key00"), Excluded("key10"))), vec![]);
+
+        // min unbounded
+        assert_eq!(get_candidates((Unbounded, Included("key20"))), vec![0, 1]);
+        assert_eq!(get_candidates((Unbounded, Excluded("key20"))), vec![0]);
+
+        // max unbounded
+        assert_eq!(get_candidates((Included("key30"), Unbounded)), vec![1, 2, 3]);
+        assert_eq!(get_candidates((Excluded("key30"), Unbounded)), vec![2, 3]);
+
+        // intersection
+        assert_eq!(get_candidates((Included("key22"), Excluded("key25"))), vec![1]);
+        assert_eq!(get_candidates((Included("key22"), Included("key25"))), vec![1]);
+        assert_eq!(get_candidates((Included("key22"), Excluded("key30"))), vec![1]);
+        assert_eq!(get_candidates((Included("key22"), Included("key30"))), vec![1, 2]);
+        assert_eq!(get_candidates((Included("key22"), Included("key35"))), vec![1, 2]);
+        assert_eq!(get_candidates((Included("key22"), Excluded("key35"))), vec![1, 2]);
+
+        assert_eq!(get_candidates((Excluded("key20"), Excluded("key25"))), vec![1]);
+        assert_eq!(get_candidates((Excluded("key20"), Included("key25"))), vec![1]);
+        assert_eq!(get_candidates((Excluded("key20"), Excluded("key30"))), vec![1]);
+        assert_eq!(get_candidates((Excluded("key20"), Included("key30"))), vec![1, 2]);
+        assert_eq!(get_candidates((Excluded("key20"), Included("key35"))), vec![1, 2]);
+        assert_eq!(get_candidates((Excluded("key20"), Excluded("key35"))), vec![1, 2]);
+    }
+}
+
