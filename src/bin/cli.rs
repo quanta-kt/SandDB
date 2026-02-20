@@ -1,6 +1,7 @@
 use std::io::{self, Write, stdin};
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::ops::Bound;
 
 use sand_db::{Store, make_store};
 
@@ -25,7 +26,7 @@ fn main() -> io::Result<()> {
 
     let is_tty = stdin().is_terminal();
 
-    loop {
+    'outer: loop {
         if is_tty {
             eprint!("> ");
         }
@@ -96,7 +97,62 @@ fn main() -> io::Result<()> {
             }
 
             "list" => {
-                match store.get_range(..) {
+                fn w_conflict() {
+                    eprintln!(
+                        "warning: conflicting filters; using values specified last."
+                    );
+                }
+
+                fn usage() {
+                    eprintln!("usage: list [(-gt|-lt|-lte|-gte) <value>]...", );
+                }
+
+                let mut args = parts.into_iter().skip(1);
+                let mut range = (Bound::Unbounded, Bound::Unbounded);
+
+                while let Some(op) = args.next() {
+                    let operand = match args.next() {
+                        Some(x) => x,
+                        None => {
+                            usage();
+                            continue 'outer;
+                        }
+                    };
+
+                    match op {
+                        "-lt" => {
+                            if range.1 != Bound::Unbounded {
+                                w_conflict();
+                            }
+                            range.1 = Bound::Excluded(operand);
+                        },
+                        "-lte" => {
+                            if range.1 != Bound::Unbounded {
+                                w_conflict();
+                            }
+                            range.1 = Bound::Included(operand);
+                        },
+                        "-gt" => {
+                            if range.0 != Bound::Unbounded {
+                                w_conflict();
+                            }
+                            range.0 = Bound::Excluded(operand);
+                        },
+                        "-gte" => {
+                            if range.0 != Bound::Unbounded {
+                                w_conflict();
+                            }
+                            range.0 = Bound::Included(operand);
+                        },
+
+                        _ => {
+                            usage();
+                            continue 'outer;
+                        }
+                    }
+                }
+
+                match store.get_range(range) {
                     Ok(iter) => {
                         for item in iter {
                             let (key, value) = item?;
