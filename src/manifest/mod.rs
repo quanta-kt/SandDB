@@ -1,6 +1,7 @@
 /// Manifest file readering and writing routines.
 /// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
 use std::ops::RangeBounds;
+use std::ops::Bound::*;
 use std::{fs, io};
 use std::{
     fs::{File, OpenOptions},
@@ -95,11 +96,39 @@ where
         self,
         range: Range,
     ) -> io::Result<Vec<SSTable>> {
+        let is_empty = match (range.start_bound(), range.end_bound()) {
+            (Included(a), Included(b)) => a > b,
+            (Included(a), Excluded(b)) => a >= b,
+            (Excluded(a), Included(b)) => a >= b,
+            (Excluded(a), Excluded(b)) => a >= b,
+            _ => false,
+        };
+
+        if is_empty {
+            return Ok(vec![]);
+        }
+
         Ok(self
             .read()?
             .sstables
             .into_iter()
-            .filter(|sstable| range.contains(&sstable.min_key) || range.contains(&sstable.max_key))
+            .filter(|sstable| {
+                let min = range.start_bound();
+                let min_matches = match min {
+                    Included(x) => x <= sstable.max_key.as_str(),
+                    Excluded(x) => x < sstable.max_key.as_str(),
+                    Unbounded => true,
+                };
+
+                let max = range.end_bound();
+                let max_matches = match max {
+                    Included(x) => x >= sstable.min_key.as_str(),
+                    Excluded(x) => x > sstable.min_key.as_str(),
+                    Unbounded => true,
+                };
+
+                return min_matches && max_matches;
+            })
             .collect())
     }
 
@@ -550,6 +579,8 @@ impl<'a> ManifestTransaction<'a> {
 mod tests {
     use super::*;
 
+    use std::ops::Bound;
+
     #[test]
     fn test_manifest_can_be_written_and_read() {
         let filename = "test_manifest_can_be_written_and_read";
@@ -651,5 +682,56 @@ mod tests {
         assert_eq!(sstables.sstables[1].id, id3);
 
         drop(writer);
+    }
+
+    #[test]
+    fn test_manifest_returns_candidates_in_range() {
+        let filename = "test_manifest_returns_candidates_in_rang";
+
+        if PathBuf::from(filename).exists() {
+            fs::remove_file(filename).unwrap();
+        }
+
+        let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
+        let mut transaction = writer.transaction();
+        let id0 = transaction.add_sstable(0, "key10", "key20");
+        let id1 = transaction.add_sstable(0, "key20", "key30");
+        let id2 = transaction.add_sstable(0, "key25", "key35");
+        let id3 = transaction.add_sstable(0, "key00", "key99");
+        transaction.commit().unwrap();
+        drop(writer);
+
+        let get_candidates = |range: (Bound<&str>, Bound<&str>)| {
+            let reader = File::open(filename).unwrap();
+            ManifestReader::new(reader)
+                .get_candidate_sstables_for_range(range)
+                .unwrap()
+                .iter()
+                .map(|it| it.id)
+                .collect::<Vec<_>>()
+        };
+
+        // empty
+        assert_eq!(get_candidates((Excluded("key15"), Excluded("key15"))), vec![]);
+        assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
+        assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
+
+        // single
+        assert_eq!(get_candidates((Included("key15"), Excluded("key16"))), vec![id0, id3]);
+        assert_eq!(get_candidates((Excluded("key15"), Excluded("key17"))), vec![id0, id3]);
+
+        // min unbounded
+        assert_eq!(get_candidates((Unbounded, Included("key16"))), vec![id0, id3]);
+        assert_eq!(get_candidates((Unbounded, Excluded("key17"))), vec![id0, id3]);
+
+        // max unbounded
+        assert_eq!(get_candidates((Included("key30"), Unbounded)), vec![id1, id2, id3]);
+        assert_eq!(get_candidates((Excluded("key30"), Unbounded)), vec![id2, id3]);
+
+        // intersection
+        assert_eq!(get_candidates((Included("key22"), Excluded("key25"))), vec![id1, id3]);
+        assert_eq!(get_candidates((Included("key22"), Included("key25"))), vec![id1, id2, id3]);
+        assert_eq!(get_candidates((Excluded("key20"), Included("key25"))), vec![id1, id2, id3]);
+        assert_eq!(get_candidates((Included("key20"), Included("key25"))), vec![id0, id1, id2, id3]);
     }
 }
