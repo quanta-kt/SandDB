@@ -186,8 +186,10 @@ pub fn make_store(directory: PathBuf) -> io::Result<DefaultStore> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::ops::Bound::*;
 
     use super::*;
+
 
     #[test]
     fn test_inserted_entries_can_be_retrieved() {
@@ -361,8 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn test_can_retrieve_range() {
-        let dir = PathBuf::from("test_can_retrieve_range");
+    fn test_can_retrive_unbounded_range() {
+        let dir = PathBuf::from("test_can_retrive_unbounded_range");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -382,6 +384,47 @@ mod tests {
                 ("foo3".to_owned(), "bar3".as_bytes().to_vec())
             ]
         );
+    }
+
+    #[test]
+    fn test_can_retrive_bounded_range() {
+        let path: PathBuf = "test_can_retrive_bounded_range".into();
+        if path.exists() {
+            std::fs::remove_dir_all(path.clone()).unwrap();
+        }
+
+        let store = make_store(path).unwrap();
+        for i in 0..1024 {
+            store
+                .insert(
+                    &format!("key_{:04}", i),
+                    &format!("value_{:04}", i).bytes().collect::<Vec<u8>>()
+                )
+                .unwrap();
+        }
+
+        let expected: Vec<_> = (100..1000)
+            .map(|i|
+                (format!("key_{:04}", i), format!("value_{:04}", i)
+                    .bytes()
+                    .collect::<Vec<_>>()))
+            .collect();
+
+        fn assert(store: &impl Store, expected: &Vec<(String, Vec<u8>)>) {
+            let actual: Vec<_> = store.get_range((Included("key_0100"), Excluded("key_1000")))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+
+            assert_eq!(&actual, expected);
+
+        }
+
+        assert(&store, &expected);
+
+        store.flush().unwrap();
+        assert(&store, &expected);
+
     }
 
     #[test]
