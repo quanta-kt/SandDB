@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use crate::async_store_impl::AsyncStoreImpl;
 use crate::lsm_tree::LSMTree;
 use crate::sstable::reader::{CachedSSTableReader, FsSSTReader};
 use crate::store::Store;
@@ -40,6 +41,10 @@ impl StoreImpl<LSMTree<CachedSSTableReader<FsSSTReader>>> {
         wal.truncate()?;
 
         StoreImpl::new(lsm_tree, wal)
+    }
+
+    pub fn to_async(self) -> AsyncStoreImpl<Self> {
+        AsyncStoreImpl::new(self)
     }
 }
 
