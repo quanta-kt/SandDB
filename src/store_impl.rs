@@ -14,7 +14,6 @@ use crate::store::Cursor;
 use crate::util::merge_sorted_uniq_cursor;
 use crate::wal::Wal;
 
-const MAX_SIZE: usize = 512;
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024; // 64 KiB
 
 pub struct StoreImpl<L: Store> {
@@ -69,21 +68,6 @@ impl<L: Store> StoreImpl<L> {
         Ok(())
     }
 
-    fn validate(&self, key: &str, value: &[u8]) -> io::Result<()> {
-        if key.len() > MAX_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Key too long"));
-        }
-
-        if value.len() > MAX_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Value too long",
-            ));
-        }
-
-        return Ok(())
-    }
-
     fn maybe_flush_memtable(&self) -> io::Result<()> {
         if self.memtable_size.load(Ordering::Relaxed) > MAX_MEMTABLE_SIZE {
             self.flush_memtable()?;
@@ -103,7 +87,6 @@ impl<L: Store> StoreImpl<L> {
 
 impl<L: Store> Store for StoreImpl<L> {
     fn insert(&self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.validate(key, value)?;
         self.wal.lock().unwrap().log_one(key, value)?;
         self.add_to_memtable(key, value)?;
 
@@ -111,10 +94,6 @@ impl<L: Store> Store for StoreImpl<L> {
     }
 
     fn insert_batch(&self, entries: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
-        for (key, value) in entries {
-            self.validate(key, value)?;
-        }
-
         self.wal.lock().unwrap().log_many(entries)?;
 
         for (key, value) in entries.iter() {
@@ -571,6 +550,56 @@ mod tests {
                 ("foo3".to_owned(), "right".as_bytes().to_vec()),
                 ("foo4".to_owned(), "right".as_bytes().to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_large_entires_can_be_inserted() {
+        let dir = PathBuf::from("test_large_keys_can_be_inserted");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = make_store(dir.clone()).unwrap();
+
+        const K: i32 = 1024;
+
+        let size_1k: String = (0..K).map(|_| 'a'.to_string()).collect();
+        let size_2k: String = (0..K*2).map(|_| 'a'.to_string()).collect();
+        let size_3k: String = (0..K*3).map(|_| 'a'.to_string()).collect();
+        let size_4k: String = (0..K*4).map(|_| 'a'.to_string()).collect();
+        let size_5k: String = (0..K*5).map(|_| 'a'.to_string()).collect();
+
+        store.insert(&size_1k, &size_1k.as_bytes()).unwrap();
+        store.insert(&size_2k, &size_2k.as_bytes()).unwrap();
+        store.insert(&size_3k, &size_3k.as_bytes()).unwrap();
+        store.insert(&size_4k, &size_4k.as_bytes()).unwrap();
+        store.insert(&size_5k, &size_5k.as_bytes()).unwrap();
+
+        store.flush().unwrap();
+
+        assert_eq!(
+            Some(size_1k.as_bytes()),
+            store.get(&size_1k).unwrap().as_ref().map(|it| &it[..])
+        );
+
+        assert_eq!(
+            Some(size_2k.as_bytes()),
+            store.get(&size_2k).unwrap().as_ref().map(|it| &it[..])
+        );
+
+        assert_eq!(
+            Some(size_3k.as_bytes()),
+            store.get(&size_3k).unwrap().as_ref().map(|it| &it[..])
+        );
+
+        assert_eq!(
+            Some(size_4k.as_bytes()),
+            store.get(&size_4k).unwrap().as_ref().map(|it| &it[..])
+        );
+
+        assert_eq!(
+            Some(size_5k.as_bytes()),
+            store.get(&size_5k).unwrap().as_ref().map(|it| &it[..])
         );
     }
 }
