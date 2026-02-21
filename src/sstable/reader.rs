@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use std::ops::Bound::*;
 
 use super::{ChunkDesc, sst_file_path};
+use super::MAGIC;
+use super::VERSION;
 
 pub trait SSTableReader {
     type ChunkIterator: Iterator<Item = io::Result<Vec<(String, Vec<u8>)>>> + 'static;
@@ -226,9 +228,15 @@ where
     }
 
     fn validate_header(&mut self) -> io::Result<()> {
-        let _ = self.file.read_u32()?;
-        let _ = self.file.read_u8()?;
-        let _ = self.file.read_u32()?;
+        let magic = self.file.read_u32()?;
+        if magic != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid SST file magic number."));
+        }
+
+        let version = self.file.read_u8()?;
+        if version != VERSION {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported SST file version."));
+        }
 
         Ok(())
     }
