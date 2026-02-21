@@ -11,7 +11,7 @@ Length is a 64 bit unsigned integer.
 
 | Section           | Size         | Description                        |
 |-------------------|--------------|------------------------------------|
-| Header            | 8 bytes      | File header with metadata          |
+| Header            | 9 bytes      | File header with metadata          |
 | Data chunks       | dynamic      | Pages containing stored data       |
 | Chunk directory   | dynamic      | Directory of chunk locations       |
 | Footer            | 12 bytes     | File footer with summary info      |
@@ -37,7 +37,7 @@ A chunk must not exceed the page size as defined in the header.
 
 | Section      | Size         | Description  |
 |--------------|--------------|--------------|
-| Chunk header | 12 bytes     | Metadata for the chunk (see below) |
+| Chunk header | 20 bytes     | Metadata for the chunk (see below) |
 | Items        | dynamic      | Actual data stored in the chunk (see below)|
 
 
