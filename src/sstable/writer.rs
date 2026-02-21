@@ -7,11 +7,14 @@ use std::path::Path;
 
 use crate::io_ext::WriteExt;
 
-use super::DEFAULT_PAGE_SIZE;
+use super::CHUNK_SIZE_TARGET;
 use super::MAGIC;
 use super::VERSION;
 use super::ChunkDesc;
 use super::sst_file_path;
+
+
+const CHUNK_HEADER_SIZE: usize = 20;
 
 pub struct SSTableWriter {
     file: Option<File>,
@@ -38,7 +41,7 @@ impl SSTableWriter {
         let mut ret = SSTableWriter {
             file: Some(file),
             chunks: Vec::new(),
-            curr_chunk_written: 0,
+            curr_chunk_written: CHUNK_HEADER_SIZE,
             curr_chunk_count: 0,
         };
 
@@ -60,7 +63,7 @@ impl SSTableWriter {
 
         let entry_size = key.len() + value.len() + 16;
 
-        if self.curr_chunk_written + entry_size > DEFAULT_PAGE_SIZE {
+        if self.curr_chunk_written + entry_size > CHUNK_SIZE_TARGET {
             self.end_chunk()?;
             self.start_chunk()?;
         }
@@ -79,7 +82,7 @@ impl SSTableWriter {
             curr.max_key = key.to_string();
         }
 
-        if self.curr_chunk_written == 0 {
+        if self.curr_chunk_count == 0 {
             // If this is the first item we are writing for this chunk,
             // it is also the min key for it.
             curr.min_key = key.to_string();
@@ -119,9 +122,6 @@ impl SSTableWriter {
         file.write_u32(self.curr_chunk_count)?;
 
         // TODO: Compress the chunk
-        // FIXME: this field does not really reflect the true size of the block
-        // and instead is only an indicator of the sum all the key and value lengths.
-        // i.o.w it does not account for things like lengths that encode prefix.
         file.write_u64(self.curr_chunk_written as u64).unwrap();
         file.write_u64(self.curr_chunk_written as u64).unwrap();
 
@@ -148,7 +148,7 @@ impl SSTableWriter {
         file.write_u64(0)?;
         file.write_u64(0)?;
 
-        self.curr_chunk_written = 0;
+        self.curr_chunk_written = CHUNK_HEADER_SIZE;
         self.curr_chunk_count = 0;
 
         Ok(())
@@ -161,7 +161,6 @@ impl SSTableWriter {
 
         file.write_u32(MAGIC)?;
         file.write_u8(VERSION)?;
-        file.write_u32(DEFAULT_PAGE_SIZE as u32)?;
         Ok(())
     }
 

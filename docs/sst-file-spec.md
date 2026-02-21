@@ -18,11 +18,10 @@ Length is a 64 bit unsigned integer.
 
 ## Header
 
-| Field | Type | Description |
-|-------|------|-------------|
-| Magic number | u32 | Magic number of the file. Must be `0xFAA7BEEF`. |
-| Version | u8 | Version of the file format. |
-| Page size | u32 | Size of the page. |
+| Field        | Type | Description                                     |
+|--------------|------|-------------------------------------------------|
+| Magic number | u32  | Magic number of the file. Must be `0xFAA7BEEF`. |
+| Version      | u8   | Version of the file format.                     |
 
 ## Footer
 
@@ -32,8 +31,6 @@ Length is a 64 bit unsigned integer.
 | Chunk count          | u32    | Number of chunks in the file       |
 
 ## Data chunks
-
-A chunk must not exceed the page size as defined in the header.
 
 | Section      | Size         | Description  |
 |--------------|--------------|--------------|
