@@ -22,6 +22,9 @@ pub struct SSTableWriter {
     chunks: Vec<ChunkDesc>,
     curr_chunk_written: usize,
     curr_chunk_count: u32,
+
+    // Last key written to current chunk
+    curr_chunk_last_key: Option<String>,
 }
 
 impl SSTableWriter {
@@ -43,6 +46,7 @@ impl SSTableWriter {
             chunks: Vec::new(),
             curr_chunk_written: CHUNK_HEADER_SIZE,
             curr_chunk_count: 0,
+            curr_chunk_last_key: None,
         };
 
         ret.write_header()?;
@@ -61,7 +65,27 @@ impl SSTableWriter {
         let key = key.as_ref();
         let value = value.as_ref();
 
-        let entry_size = key.len() + value.len() + 16;
+        let last_key = self.curr_chunk_last_key
+            .as_ref()
+            .map(|it| it.as_str().as_bytes())
+            .unwrap_or(b"");
+
+        let key_bytes = key.as_bytes();
+
+        let mut prefix_len = last_key
+            .iter()
+            .zip(key_bytes)
+            .take_while(|(a, b)| {
+                a == b
+            })
+            .count();
+
+        let mut suffix = &key_bytes[prefix_len..];
+
+        let entry_size =
+            suffix.len()
+            + value.len()
+            + 24; // prefix length (8) + suffix length (8) + value length (8)
 
         // Tolerate exceeding the target if this is the first key being written to this chunk. This
         // avoids creating an empty chunk in case of a single large key.
@@ -70,6 +94,11 @@ impl SSTableWriter {
 
             self.end_chunk()?;
             self.start_chunk()?;
+
+            // We just started a new chunk, which means our previous calculations are invalid.
+            // There is no prefix since this is now the first key.
+            suffix = &key_bytes;
+            prefix_len = 0;
         }
 
         let file = self.file
@@ -79,7 +108,8 @@ impl SSTableWriter {
         let index = self.chunks.len() - 1;
         let curr = &mut self.chunks[index];
 
-        file.write_string(key).unwrap();
+        file.write_u64(prefix_len as u64)?;
+        file.write_bytes(suffix).unwrap();
         file.write_bytes(value).unwrap();
 
         if key > &curr.max_key {
@@ -94,6 +124,7 @@ impl SSTableWriter {
 
         self.curr_chunk_written += entry_size;
         self.curr_chunk_count += 1;
+        self.curr_chunk_last_key = Some(key.to_string());
 
         Ok(())
     }
@@ -154,6 +185,7 @@ impl SSTableWriter {
 
         self.curr_chunk_written = CHUNK_HEADER_SIZE;
         self.curr_chunk_count = 0;
+        self.curr_chunk_last_key = None;
 
         Ok(())
     }

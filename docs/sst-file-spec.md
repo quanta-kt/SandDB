@@ -48,10 +48,15 @@ Length is a 64 bit unsigned integer.
 
 ### Item
 
-| Field | Type | Description |
-|-------|------|-------------|
-| Key   | string | The key of the item. |
-| Value | string | The value of the item. |
+| Field      | Type   | Description |
+|------------|--------|-------------|
+| Prefix len | u64    | Prefix length shared with previous key in this chunk. Should be 0 for first item. |
+| Key suffix | string | Suffix of the key of the item. |
+| Value      | string | The value of the item. |
+
+Full key is computed by looking at previous key upto given prefix length and
+adding key suffix to it. First key in the chunk does not share prefix with any
+other item and it's prefix length should therefore be 0.
 
 ## Chunk directory
 

@@ -285,9 +285,29 @@ where
 
         let mut result = Vec::with_capacity(item_count as usize);
 
+        let mut last_key = Vec::new();
+
         for _ in 0..item_count {
-            let key = self.file.read_string()?;
+            let prefix_len = self.file.read_u64()? as usize;
+            let mut suffix = self.file.read_bytes()?;
             let value = self.file.read_bytes()?;
+
+            let mut key_bytes = last_key
+                .get(..prefix_len)
+                .ok_or_else(||
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Broken SST: prefix length is larger than previous key"
+                    )
+                )?
+                .to_vec();
+
+            key_bytes.append(&mut suffix);
+
+            last_key = key_bytes.clone();
+
+            let key = String::from_utf8(key_bytes).unwrap();
+
             result.push((key, value));
         }
 

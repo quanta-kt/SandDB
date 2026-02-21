@@ -18,6 +18,14 @@ def read_string(f):
     data = f.read(length)
     return repr(data)[1:]
 
+def read_string_prefix_compressed(prefix_base, f):
+    prefix_len = read_u64(f)
+    length = read_u64(f)
+    suffix = f.read(length)
+
+    ret = prefix_base[0:prefix_len] + suffix
+    return prefix_len, ret
+
 with open(file, "rb") as f:
     f.seek(0)
     magic = read_u32(f)
@@ -69,7 +77,10 @@ with open(file, "rb") as f:
         print(f"    compressed_size: {compressed_size}")
         print(f"    uncompressed_size: {uncompressed_size}")
 
+        last_key = b""
         for j in range(item_count):
-            key = read_string(f)
+            prefix_len, key = read_string_prefix_compressed(last_key, f)
             value = read_string(f)
-            print(f"    {key} => {value}")
+            last_key = key
+            print(f"   ({prefix_len}) {key} => {value}")
+
