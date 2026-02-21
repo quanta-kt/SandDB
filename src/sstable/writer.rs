@@ -63,7 +63,11 @@ impl SSTableWriter {
 
         let entry_size = key.len() + value.len() + 16;
 
-        if self.curr_chunk_written + entry_size > CHUNK_SIZE_TARGET {
+        // Tolerate exceeding the target if this is the first key being written to this chunk. This
+        // avoids creating an empty chunk in case of a single large key.
+        if self.curr_chunk_count != 0 &&
+            self.curr_chunk_written + entry_size > CHUNK_SIZE_TARGET {
+
             self.end_chunk()?;
             self.start_chunk()?;
         }
@@ -187,6 +191,36 @@ impl Drop for SSTableWriter {
             eprintln!("BUG: SSTableWriter dropped without finalize()");
             let _ = self.finalize();
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_inserting_large_keys_does_not_result_in_empty_chunks() {
+        use crate::sstable::reader::RawSSTableReader;
+
+        let path = PathBuf::from("test_inserting_large_keys_does_not_result_in_empty_chunks");
+        let _ = fs::remove_file(&path);
+
+        let large_value: String = (0..1024*4).map(|_| 'a').collect();
+
+        let mut writer = SSTableWriter::new(File::create(path.clone()).unwrap()).unwrap();
+
+        writer.write(&large_value, &large_value.as_bytes()).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(writer.chunks.len(), 1);
+
+        drop(writer);
+
+        let mut reader = RawSSTableReader::open(path).unwrap();
+        let chunks = reader.list_chunks().unwrap();
+        assert_eq!(chunks.len(), 1);
     }
 }
 
