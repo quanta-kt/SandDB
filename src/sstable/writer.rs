@@ -109,8 +109,8 @@ impl SSTableWriter {
         let curr = &mut self.chunks[index];
 
         file.write_u64(prefix_len as u64)?;
-        file.write_bytes(suffix).unwrap();
-        file.write_bytes(value).unwrap();
+        file.write_bytes(suffix)?;
+        file.write_bytes(value)?;
 
         if key > &curr.max_key {
             curr.max_key = key.to_string();
@@ -157,8 +157,8 @@ impl SSTableWriter {
         file.write_u32(self.curr_chunk_count)?;
 
         // TODO: Compress the chunk
-        file.write_u64(self.curr_chunk_written as u64).unwrap();
-        file.write_u64(self.curr_chunk_written as u64).unwrap();
+        file.write_u64(self.curr_chunk_written as u64)?;
+        file.write_u64(self.curr_chunk_written as u64)?;
 
         file.seek(SeekFrom::Start(old_pos))?;
 
