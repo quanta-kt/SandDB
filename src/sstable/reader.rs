@@ -242,7 +242,7 @@ where
     }
 
     fn read_footer(&mut self) -> io::Result<Footer> {
-        self.file.seek(SeekFrom::End(-12)).unwrap();
+        self.file.seek(SeekFrom::End(-12))?;
 
         let chunk_dir_pos = self.file.read_u64()?;
         let chunk_count = self.file.read_u32()?;
@@ -306,7 +306,12 @@ where
 
             last_key = key_bytes.clone();
 
-            let key = String::from_utf8(key_bytes).unwrap();
+            let key = String::from_utf8(key_bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Possiblly corrupt SST file: attempted to read invalid UTF8 key."
+                )
+            })?;
 
             result.push((key, value));
         }
@@ -323,7 +328,7 @@ pub struct SSTChunkIterator {
 
 impl SSTChunkIterator {
     pub fn open(path: PathBuf) -> io::Result<SSTChunkIterator> {
-        let mut reader = RawSSTableReader::open(path).unwrap();
+        let mut reader = RawSSTableReader::open(path)?;
         let chunk_descs = reader.list_chunks()?;
 
         Ok(SSTChunkIterator::new(reader, chunk_descs))
