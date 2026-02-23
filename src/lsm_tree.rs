@@ -179,7 +179,7 @@ impl<S: SSTableReader> LSMTree<S> {
             Err(io::Error::new(io::ErrorKind::Other, "Unable to aquire lock on manifest writer: mutex poisoned"))
         })?;
         let mut txn = writer.transaction();
-        let id = txn.add_sstable(0, min_key, max_key);
+        let id = txn.add_sstable(0, min_key, max_key)?;
 
         let mut writer = SSTableWriter::open(&self.directory, id)?;
         for (key, value) in source.iter() {
@@ -281,9 +281,9 @@ impl<S: SSTableReader> LSMTree<S> {
             Err(io::Error::new(io::ErrorKind::Other, "Unable to aquire lock on manifest writer: mutex poisoned"))
         })?;
         let mut txn = writer.transaction();
-        txn.remove_sstables(to_merge.iter().map(|it| it.id).collect());
+        txn.remove_sstables(to_merge.iter().map(|it| it.id).collect())?;
 
-        let sst_id = txn.add_sstable(target_level, &min_key, max_key);
+        let sst_id = txn.add_sstable(target_level, &min_key, max_key)?;
 
         let mut writer = SSTableWriter::open(&self.directory, sst_id)?;
         for item in merged {
