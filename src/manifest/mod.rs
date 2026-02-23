@@ -328,7 +328,7 @@ where
 /// ```ignore
 /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
 /// let mut transaction = writer.transaction();
-/// transaction.add_sstable(0, "key1", "key2");
+/// transaction.add_sstable(0, "key1", "key2").unwrap();
 /// transaction.commit().unwrap();
 /// ```
 ///
@@ -371,14 +371,14 @@ impl ManifestWriter {
             .write(true)
             .open(path)?;
 
-        let pos = file.seek(SeekFrom::End(0)).unwrap();
+        let pos = file.seek(SeekFrom::End(0))?;
 
         let mut writer = ManifestWriter::new(file, lock_path, lock);
 
         if pos == 0 {
-            writer.init();
+            writer.init()?;
         } else {
-            writer.compact();
+            writer.compact()?;
         }
 
         Ok(writer)
@@ -392,26 +392,27 @@ impl ManifestWriter {
         }
     }
 
-    fn init(&mut self) {
-        self.file.seek(SeekFrom::Start(0)).unwrap();
-        self.file.set_len(0).unwrap();
+    fn init(&mut self) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.set_len(0)?;
 
         // Magic number
-        self.file.write_u32(MAGIC).unwrap();
+        self.file.write_u32(MAGIC)?;
 
         // Version
-        self.file.write_u8(1).unwrap();
+        self.file.write_u8(1)?;
 
         // Next SST file ID
-        self.file.write_u64(0).unwrap();
-        self.file.sync_all().unwrap();
+        self.file.write_u64(0)?;
+        self.file.sync_all()?;
+
+        Ok(())
     }
 
-    fn compact(&mut self) {
-        self.file.seek(SeekFrom::Start(0)).unwrap();
+    fn compact(&mut self) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
         let manifest = ManifestReader::new(&mut self.file)
-            .read_skip_invalid()
-            .unwrap();
+            .read_skip_invalid()?;
 
         let mut txn = self.transaction();
 
@@ -423,10 +424,12 @@ impl ManifestWriter {
                 &sstable.min_key,
                 &sstable.max_key,
                 sstable.id,
-            );
+            )?;
         }
 
-        txn.commit().unwrap();
+        txn.commit()?;
+
+        Ok(())
     }
 
     ///  Starts a new transaction. Writing to the manifest file is done through this transaction.
@@ -471,7 +474,7 @@ impl<'a> ManifestTransaction<'a> {
     /// ```ignore
     /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
     /// let mut transaction = writer.transaction();
-    /// transaction.add_sstable(0, "key1", "key2");
+    /// transaction.add_sstable(0, "key1", "key2").unwrap();
     /// transaction.commit().unwrap();
     /// ```
     pub fn commit(self) -> io::Result<()> {
@@ -504,45 +507,58 @@ impl<'a> ManifestTransaction<'a> {
     /// Batch a new sstable addition to the manifest file.
     ///
     /// Returns the ID of the added sstable that will be written to the file.
-    pub fn add_sstable(&mut self, level: u8, min_key: &str, max_key: &str) -> u64 {
-        let id = self.allocate_sstable_id();
-        self.write_sstable_with_id(level, min_key, max_key, id);
+    pub fn add_sstable(
+        &mut self,
+        level: u8,
+        min_key: &str,
+        max_key: &str
+    ) -> io::Result<u64> {
+        let id = self.allocate_sstable_id()?;
+        self.write_sstable_with_id(level, min_key, max_key, id)?;
 
-        id
+        Ok(id)
     }
 
-    fn write_sstable_with_id(&mut self, level: u8, min_key: &str, max_key: &str, id: u64) {
+    fn write_sstable_with_id(
+        &mut self,
+        level: u8,
+        min_key: &str,
+        max_key: &str,
+        id: u64
+    ) -> io::Result<()> {
         let mut buf = Vec::new();
 
-        buf.write_u8(TYPE_ADD_SSTABLE).unwrap();
-        buf.write_u8(level).unwrap();
-        buf.write_string(min_key).unwrap();
-        buf.write_string(max_key).unwrap();
-        buf.write_u64(id).unwrap();
+        buf.write_u8(TYPE_ADD_SSTABLE)?;
+        buf.write_u8(level)?;
+        buf.write_string(min_key)?;
+        buf.write_string(max_key)?;
+        buf.write_u64(id)?;
 
         let crc = crc32c(&buf);
 
-        self.write_buf.write_u32(crc).unwrap();
-        self.write_buf.write_u32(buf.len() as u32).unwrap();
-        self.write_buf.write_all(&buf).unwrap();
+        self.write_buf.write_u32(crc)?;
+        self.write_buf.write_u32(buf.len() as u32)?;
+        self.write_buf.write_all(&buf)?;
+
+        Ok(())
     }
 
-    fn allocate_sstable_id(&mut self) -> u64 {
+    fn allocate_sstable_id(&mut self) -> io::Result<u64> {
         let current = self.next_sst_id;
 
         let id = if let Some(current) = current {
             current
         } else {
-            self.inner.file.seek(SeekFrom::Start(5)).unwrap();
-            let id = self.inner.file.read_u64().unwrap();
-            self.inner.file.seek(SeekFrom::End(0)).unwrap();
+            self.inner.file.seek(SeekFrom::Start(5))?;
+            let id = self.inner.file.read_u64()?;
+            self.inner.file.seek(SeekFrom::End(0))?;
 
             id
         };
 
         self.next_sst_id = Some(id + 1);
 
-        id
+        Ok(id)
     }
 
     /// Batch a sstable removal from the manifest file.
@@ -552,26 +568,30 @@ impl<'a> ManifestTransaction<'a> {
     /// ```ignore
     /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
     /// let mut transaction = writer.transaction();
-    /// transaction.remove_sstable(0);
+    /// transaction.remove_sstable(0).unwrap();
     /// transaction.commit().unwrap();
     /// ```
-    pub fn remove_sstable(&mut self, id: u64) {
+    pub fn remove_sstable(&mut self, id: u64) -> io::Result<()> {
         let mut buf = Vec::new();
 
-        buf.write_u8(TYPE_REMOVE_SSTABLE).unwrap();
-        buf.write_u64(id).unwrap();
+        buf.write_u8(TYPE_REMOVE_SSTABLE)?;
+        buf.write_u64(id)?;
 
         let crc = crc32c(&buf);
 
-        self.write_buf.write_u32(crc).unwrap();
-        self.write_buf.write_u32(buf.len() as u32).unwrap();
-        self.write_buf.write_all(&buf).unwrap();
+        self.write_buf.write_u32(crc)?;
+        self.write_buf.write_u32(buf.len() as u32)?;
+        self.write_buf.write_all(&buf)?;
+
+        Ok(())
     }
 
-    pub fn remove_sstables(&mut self, ids: Vec<u64>) {
+    pub fn remove_sstables(&mut self, ids: Vec<u64>) -> io::Result<()> {
         for id in ids {
-            self.remove_sstable(id);
+            self.remove_sstable(id)?;
         }
+
+        Ok(())
     }
 }
 
@@ -591,7 +611,7 @@ mod tests {
 
         let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
         let mut transaction = writer.transaction();
-        transaction.add_sstable(0, "key1", "key2");
+        transaction.add_sstable(0, "key1", "key2").unwrap();
         transaction.commit().unwrap();
 
         let reader = File::open(filename).unwrap();
@@ -611,7 +631,7 @@ mod tests {
         let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
 
         let mut transaction = writer.transaction();
-        transaction.add_sstable(0, "key1", "key2");
+        transaction.add_sstable(0, "key1", "key2").unwrap();
 
         let reader = File::open(filename).unwrap();
         let sstables = ManifestReader::new(reader).read().unwrap();
@@ -635,7 +655,7 @@ mod tests {
 
         let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
         let mut transaction = writer.transaction();
-        let id = transaction.add_sstable(0, "key1", "key2");
+        let id = transaction.add_sstable(0, "key1", "key2").unwrap();
 
         assert_eq!(id, 0);
 
@@ -657,12 +677,12 @@ mod tests {
 
         let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
         let mut transaction = writer.transaction();
-        let id0 = transaction.add_sstable(0, "key1", "key2");
-        let id1 = transaction.add_sstable(0, "key2", "key3");
-        transaction.remove_sstable(id0);
-        transaction.remove_sstable(id1);
-        let id2 = transaction.add_sstable(0, "key3", "key4");
-        let id3 = transaction.add_sstable(0, "key4", "key5");
+        let id0 = transaction.add_sstable(0, "key1", "key2").unwrap();
+        let id1 = transaction.add_sstable(0, "key2", "key3").unwrap();
+        transaction.remove_sstable(id0).unwrap();
+        transaction.remove_sstable(id1).unwrap();
+        let id2 = transaction.add_sstable(0, "key3", "key4").unwrap();
+        let id3 = transaction.add_sstable(0, "key4", "key5").unwrap();
         transaction.commit().unwrap();
 
         drop(writer);
@@ -694,10 +714,10 @@ mod tests {
 
         let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
         let mut transaction = writer.transaction();
-        let id0 = transaction.add_sstable(0, "key10", "key20");
-        let id1 = transaction.add_sstable(0, "key20", "key30");
-        let id2 = transaction.add_sstable(0, "key25", "key35");
-        let id3 = transaction.add_sstable(0, "key00", "key99");
+        let id0 = transaction.add_sstable(0, "key10", "key20").unwrap();
+        let id1 = transaction.add_sstable(0, "key20", "key30").unwrap();
+        let id2 = transaction.add_sstable(0, "key25", "key35").unwrap();
+        let id3 = transaction.add_sstable(0, "key00", "key99").unwrap();
         transaction.commit().unwrap();
         drop(writer);
 
