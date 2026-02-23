@@ -73,14 +73,14 @@ impl LSMTree<CachedSSTableReader<FsSSTReader>> {
 }
 
 impl<S: SSTableReader> LSMTree<S> {
-    fn manifest_reader(&self) -> ManifestReader<File> {
+    fn manifest_reader(&self) -> io::Result<ManifestReader<File>> {
         let manifest_path = self.directory.join("manifest");
-        let manifest_file = File::open(manifest_path).unwrap();
-        ManifestReader::new(manifest_file)
+        let manifest_file = File::open(manifest_path)?;
+        Ok(ManifestReader::new(manifest_file))
     }
 
     fn read_manifest(&self) -> Result<Manifest, io::Error> {
-        let manifest = self.manifest_reader().read()?;
+        let manifest = self.manifest_reader()?.read()?;
 
         // Each time we read the manifest, we update the level zero count
         self.level_zero_count.store(
@@ -92,7 +92,7 @@ impl<S: SSTableReader> LSMTree<S> {
     }
 
     pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        let candidate_ssts = self.manifest_reader().get_candidate_sstables_for_key(key)?;
+        let candidate_ssts = self.manifest_reader()?.get_candidate_sstables_for_key(key)?;
 
         for candidate in candidate_ssts.iter().rev() {
             let candidate_chunks = self
@@ -116,7 +116,7 @@ impl<S: SSTableReader> LSMTree<S> {
         range: R,
     ) -> io::Result<impl Cursor + 'a> {
         let mut candidate_ssts = self
-            .manifest_reader()
+            .manifest_reader()?
             .get_candidate_sstables_for_range(range.clone())?;
 
         // Since manifest is ordered oldest to most recent, we need to reverse the list
@@ -175,7 +175,9 @@ impl<S: SSTableReader> LSMTree<S> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source is empty"))?
             .0;
 
-        let mut writer = self.manifest_writer.lock().unwrap();
+        let mut writer = self.manifest_writer.lock().or_else(|_| {
+            Err(io::Error::new(io::ErrorKind::Other, "Unable to aquire lock on manifest writer: mutex poisoned"))
+        })?;
         let mut txn = writer.transaction();
         let id = txn.add_sstable(0, min_key, max_key);
 
@@ -247,14 +249,16 @@ impl<S: SSTableReader> LSMTree<S> {
             .iter()
             .map(|it| it.min_key.as_str())
             .min()
-            // SAFETY: we know that there are at least 3 sstables
-            .unwrap();
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "BUG: merge_ssts called with empty Vec<SSTable>")
+            })?;
 
         let max_key = to_merge
             .iter()
             .map(|it| it.max_key.as_str())
             .max()
-            // SAFETY: we know that there are at least 3 sstables
+            // SAFETY: we know that there is at least one element in this vec since we already
+            // checked that for computing min
             .unwrap();
 
         let mut sources = Vec::with_capacity(to_merge.len());
@@ -273,7 +277,9 @@ impl<S: SSTableReader> LSMTree<S> {
 
         let merged = merge_sorted_uniq_cursor(sources);
 
-        let mut writer = self.manifest_writer.lock().unwrap();
+        let mut writer = self.manifest_writer.lock().or_else(|_| {
+            Err(io::Error::new(io::ErrorKind::Other, "Unable to aquire lock on manifest writer: mutex poisoned"))
+        })?;
         let mut txn = writer.transaction();
         txn.remove_sstables(to_merge.iter().map(|it| it.id).collect());
 
@@ -454,7 +460,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let ssts = tree.manifest_reader().read().unwrap();
+        let ssts = tree.manifest_reader().unwrap().read().unwrap();
 
         tree.merge_ssts(ssts.sstables, 1).unwrap();
 
