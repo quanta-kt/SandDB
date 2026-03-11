@@ -112,7 +112,7 @@ impl SSTableWriter {
         file.write_bytes(suffix)?;
         file.write_bytes(value)?;
 
-        if key > &curr.max_key {
+        if key > curr.max_key.as_str() {
             curr.max_key = key.to_string();
         }
 
