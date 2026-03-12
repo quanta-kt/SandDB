@@ -20,9 +20,6 @@ const FILENAME: &'static str = "wal.log";
 
 pub struct Wal {
     wal: File,
-
-    #[cfg(unix)]
-    dir: File,
 }
 
 
@@ -40,21 +37,22 @@ impl Wal {
             );
 
         #[cfg(unix)]
-        let dir = OpenOptions::new()
-            .read(true)
-            .open(directory)?;
+        {
+            let dir = OpenOptions::new()
+                .read(true)
+                .open(directory)?;
+
+            dir.sync_all()?;
+        }
 
         Ok(Self {
             wal,
-
-            #[cfg(unix)]
-            dir,
         })
     }
 
     pub fn log_one(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         self.log_one_no_sync(key, value)?;
-        self.wal.sync_all()?;
+        self.wal.sync_data()?;
         Ok(())
     }
 
@@ -63,7 +61,7 @@ impl Wal {
             self.log_one_no_sync(key, value)?;
         }
 
-        self.wal.sync_all()?;
+        self.wal.sync_data()?;
 
         Ok(())
     }
@@ -86,8 +84,6 @@ impl Wal {
         self.write_header()?;
 
         self.wal.sync_all()?;
-        #[cfg(unix)]
-        self.dir.sync_all()?;
 
         Ok(())
     }
