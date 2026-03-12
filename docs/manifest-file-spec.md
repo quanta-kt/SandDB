@@ -1,14 +1,19 @@
 # Manifest file
 
-Each database has a manifest file that lists the SSTables currently in the database.
+A binary file that lists SSTables currently in the database.
+Structured like a WAL for atomic updates.
 
-It is a binary file with sequential entries of WAL-like events such as:
+Each entry has:
 
-* add sstable
-* remove sstable
+* New sstables
+* Deleted sstable ID
+* Next SST ID
 
-This WAL-like events format allow readers to read even when a writer is writing, since
+This WAL-like format allow readers to read even when a writer is writing, since
 the writer works in append-only mode.
+
+A CRC prefixed to each entry makes writing to manifest atomic in addition to
+helping with corruption.
 
 # File format (Version 1)
 
@@ -18,30 +23,25 @@ the writer works in append-only mode.
 |-------|------|-------------|
 | Magic number | u32 | Magic number of the file. Must be `0xBEEFFE57`. |
 | Version | u8 | Version of the file format. Must be `1`. |
-| Next SST ID | 64u | Next ID to use for SST filename |
 
 ## Entry
 
-| Field | Type | Description |
-|-------|------|-------------|
-| CRC32C | u32 | CRC32C of the entry, excluding the CRC32C and the length field. |
-| Length | u32 | Length of the entry. |
-| Type | u8 | Type of the entry. 1 = add sstable, 2 = remove sstable. |
-| Data | depends on the type | Data of the entry. |
+| Field         | Type      | Description |
+|---------------|-----------|-------------|
+| CRC32C        | u32       | CRC32C of the entry, excluding the CRC32C and the length field. |
+| Length        | u32       | Length of "Data" field. |
+| Next SST ID   | u64       | ID of the sstable.                |
+| Added count   | u64       |                                   |
+| Added         | SSTable[] | Array of SSTables added.          |
+| Removed count | u64       |                                   |
+| Removed       | u64[]     | Array of IDs of SSTables removed  |
 
-### Data
+### SSTable 
 
-#### Add sstable
-
-| Field | Type | Description |
-|-------|------|-------------|
-| Level | u8 | Level of the sstable. |
+| Field   | Type   | Description             |
+|---------|--------|-------------------------|
+| ID      | u64    | ID of the sstable.      |
+| Level   | u8     | Level of the sstable.   |
 | Min key | string | Min key of the sstable. |
 | Max key | string | Max key of the sstable. |
-| ID | u64 | ID of the sstable. |
 
-#### Remove sstable
-
-| Field | Type | Description |
-|-------|------|-------------|
-| ID | u64 | ID of the sstable. |

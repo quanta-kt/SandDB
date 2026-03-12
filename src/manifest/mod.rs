@@ -1,101 +1,173 @@
-/// Manifest file readering and writing routines.
-/// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
-use std::ops::RangeBounds;
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::ops::Bound::*;
-use std::{fs, io};
-use std::{
-    fs::{File, OpenOptions},
-    io::{Cursor, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
-};
+use std::ops::RangeBounds;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use fs2::FileExt;
+use arc_swap::ArcSwap;
 
-use crate::{
-    crc::crc32c,
-    io_ext::{ReadExt, WriteExt},
-};
+pub mod reader;
+pub mod writer;
 
-const MAGIC: u32 = 0xBEEFFE57;
+pub(crate) const MAGIC: u32 = 0xBEEFFE57;
 
-const TYPE_ADD_SSTABLE: u8 = 1;
-const TYPE_REMOVE_SSTABLE: u8 = 2;
-
-pub struct Manifest {
-    pub sstables: Vec<SSTable>,
-}
-
-pub struct SSTable {
+#[derive(Debug, Clone)]
+pub struct SSTableDesc {
     pub id: u64,
     pub level: u8,
     pub min_key: String,
     pub max_key: String,
 }
 
-pub struct AddSSTable {
-    sstable: SSTable,
+pub struct Manifest {
+    sstables: ArcSwap<BTreeMap<u64, SSTableDesc>>,
+    next_sstable_id: Arc<AtomicU64>,
+
+    file: File,
+
+    _lock_path: PathBuf,
+    _lock_file: File,
+
+    writer_lock: Mutex<()>,
 }
 
-pub struct RemoveSSTable {
-    id: u64,
+pub struct ManifestUpdate {
+    add: Vec<SSTableDesc>,
+    remove: Vec<u64>,
+    next_sstable_id: Arc<AtomicU64>,
 }
 
-pub enum Entry {
-    AddSSTable(AddSSTable),
-    RemoveSSTable(RemoveSSTable),
-}
-
-enum ReadResult {
-    Entry(Entry),
-    Invalid,
-}
-
-/// Reader for manifest file.
-/// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
-///
-/// This struct is largly "use-once". The functions intentially *consume* the reader here for
-/// simplicity. For example, we don't have to rewind/seek the reader to prepare it for another use.
-pub struct ManifestReader<R>(R)
-where
-    R: Read + Seek;
-
-impl<R> ManifestReader<R>
-where
-    R: Read + Seek,
-{
-    /// Create a new manifest reader.
-    pub fn new(inner: R) -> Self {
-        Self(inner)
+impl ManifestUpdate {
+    fn new(next_sstable_id: Arc<AtomicU64>) -> Self {
+        Self {
+            add: Vec::new(),
+            remove: Vec::new(),
+            next_sstable_id,
+        }
     }
 
-    /// Determine the SSTables that may contain the given key.
-    /// This limits our search space before we actually begin to read SSTables from the disk.
-    ///
-    /// An SSTable entry has a min key and max key describing the range of keys it contains.
-    ///
-    /// Note that this does not actually read the SSTables from the disk and only returns
-    /// _descriptors/IDs_ of the SSTables which can be used to read the SSTables from the disk
-    /// using an [`SSTableReader`](crate::sstable::reader::SSTableReader).
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
-    /// let candidate_sstables: Vec<SSTable> = reader.get_candidate_sstables_for_key("key1").unwrap();
-    /// ```
-    pub fn get_candidate_sstables_for_key(self, key: &str) -> io::Result<Vec<SSTable>> {
-        Ok(self
-            .read()?
+    pub fn add<K1, K2>(&mut self, level: u8, min_key: K1, max_key: K2) -> u64
+    where
+        K1: AsRef<str>,
+        K2: AsRef<str>
+    {
+        let id = self.next_sstable_id.fetch_add(1, Ordering::Relaxed);
+
+        self.add.push(SSTableDesc {
+            id,
+            level,
+            min_key: min_key.as_ref().to_owned(),
+            max_key: max_key.as_ref().to_owned(),
+        });
+
+        id
+    }
+
+    pub fn remove(&mut self, id: u64) {
+        self.remove.push(id);
+    }
+}
+
+impl Manifest {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let manifest_file_path = path.as_ref().join("manifest");
+
+        let _lock_path = manifest_file_path.with_extension("lock");
+
+        let _lock_file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&_lock_path)?;
+
+        _lock_file.try_lock_exclusive()?;
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(&manifest_file_path)?;
+
+        // Ensure the file isn't empty and at least the header is written since our reader expects
+        // at least the header to be present.
+        writer::ManifestWriter::ensure_header(&mut file)?;
+
+        // We are past the header, seek back to read
+        file.seek(SeekFrom::Start(0))?;
+
+        let state = reader::ManifestReader::new(&file).read()?;
+        // after the, we are at the end of the file, which is what manifest writer expects.
+
+        Ok(Self {
+            sstables: ArcSwap::from_pointee(state.sstables),
+            next_sstable_id: Arc::new(AtomicU64::new(state.next_sst_id)),
+
+            file,
+
+            _lock_path,
+            _lock_file,
+
+            writer_lock: Mutex::new(()),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn get_sstables(&self) -> Vec<SSTableDesc> {
+        let mut result: Vec<_> = self
             .sstables
-            .into_iter()
+            .load()
+            .values()
+            .cloned()
+            .collect();
+
+        result.sort_unstable_by_key(|it| (it.level, Reverse(it.id)));
+
+        result
+    }
+
+    pub fn get_sstables_at_level(&self, level: u8) -> Vec<SSTableDesc> {
+        let mut result: Vec<_> = self
+            .sstables
+            .load()
+            .values()
+            .filter(|it| it.level == level)
+            .cloned()
+            .collect();
+
+        result.sort_unstable_by_key(|it| (it.level, Reverse(it.id)));
+
+        result
+    }
+
+    pub fn get_candidate_sstables_for_key(&self, key: &str) -> Vec<SSTableDesc> {
+        let mut result: Vec<_> = self
+            .sstables
+            .load()
+            .values()
             .filter(|sstable| sstable.min_key.as_str() <= key && sstable.max_key.as_str() >= key)
-            .collect())
+            .cloned()
+            .collect();
+
+        result.sort_unstable_by_key(|it| (it.level, Reverse(it.id)));
+
+        result
     }
 
     pub fn get_candidate_sstables_for_range<Range: RangeBounds<str>>(
-        self,
+        &self,
         range: Range,
-    ) -> io::Result<Vec<SSTable>> {
+    ) -> Vec<SSTableDesc> {
         let is_empty = match (range.start_bound(), range.end_bound()) {
             (Included(a), Included(b)) => a > b,
             (Included(a), Excluded(b)) => a >= b,
@@ -105,13 +177,13 @@ where
         };
 
         if is_empty {
-            return Ok(vec![]);
+            return vec![];
         }
 
-        Ok(self
-            .read()?
+        let mut result: Vec<_> = self
             .sstables
-            .into_iter()
+            .load()
+            .values()
             .filter(|sstable| {
                 let min = range.start_bound();
                 let min_matches = match min {
@@ -129,629 +201,191 @@ where
 
                 return min_matches && max_matches;
             })
-            .collect())
+            .cloned()
+            .collect();
+
+        result.sort_unstable_by_key(|it| (it.level, Reverse(it.id)));
+
+        result
     }
 
-    /// Reads the manifest file.
-    ///
-    /// Returns a Vec of all SSTable descriptors in the manifest file.
-    ///
-    /// We continue to read the manifest file ever after an invalid entry is encountered.
-    /// This behaviour is useful for recovering from corruption.
-    ///
-    /// Sometimes it is desirable to read only until the last valid entry. For such times,
-    /// use [`read_skip_invalid`](Self::read_skip_invalid) instead.
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
-    /// let manifest: Manifest = reader.read().unwrap();
-    /// let sstables: Vec<SSTable> = manifest.sstables;
-    ///
-    /// assert_eq!(sstables.len(), 2);
-    /// ```
-    pub fn read(mut self) -> Result<Manifest, io::Error> {
-        self.read_validate_header()?;
-
-        let sstables = self.read_sstables(true)?;
-        Ok(Manifest { sstables })
+    pub fn start_update(&self) -> ManifestUpdate {
+        ManifestUpdate::new(self.next_sstable_id.clone())
     }
 
-    /// Reads the manifest file until a invalid entry is encountered.
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
-    /// let manifest: Manifest = reader.read_skip_invalid().unwrap();
-    /// let sstables: Vec<SSTable> = manifest.sstables;
-    ///
-    /// assert_eq!(sstables.len(), 2);
-    /// ```
-    fn read_skip_invalid(&mut self) -> Result<Manifest, io::Error> {
-        self.read_validate_header()?;
+    pub fn update(&self, update: ManifestUpdate) -> io::Result<()> {
+        let lock = self.writer_lock.lock().unwrap();
 
-        let sstables = self.read_sstables(false)?;
-        Ok(Manifest { sstables })
-    }
+        let mut writer = writer::ManifestWriter::open(self.file.try_clone()?)?;
+        writer.write(
+            &update.add,
+            &update.remove,
+            self.next_sstable_id.load(Ordering::Relaxed),
+        )?;
 
-    /// Reads the manifest file header and returns the next SST ID.
-    ///
-    /// When the header is invalid, this function returns an error.
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
-    /// let next_sst_id = reader.read_validate_header().unwrap();
-    /// ```
-    fn read_validate_header(&mut self) -> io::Result<u64> {
-        let magic = self.0.read_u32()?;
-        let version = self.0.read_u8()?;
-        let next_sst_id = self.0.read_u64()?;
+        let mut state = (*self.sstables.load_full()).clone();
 
-        if magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid manifest magic number",
-            ));
+        for sst in update.add {
+            state.insert(sst.id, sst);
         }
 
-        if version != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported manifest version: {version}"),
-            ));
+        for id in update.remove {
+            state.remove(&id);
         }
 
-        Ok(next_sst_id)
-    }
+        self.sstables.store(Arc::new(state));
 
-    /// Reads the SSTables from the manifest file. Stopping at the first invalid entry
-    /// if `stop_at_invalid` is true. Otherwise, it will continue to read the manifest file,
-    /// trying to recover from corruption.
-    ///
-    /// Each entry is prefixed with a CRC32C, this is used to determine if the entry is corrupt.
-    /// We try to recover from the corruption by attempting to read until either:
-    ///
-    /// - We find a valid entry.
-    /// - We reach the end of the file.
-    ///
-    /// Returns a Vec of all SSTable descriptors in the manifest file.
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let reader = ManifestReader::new(File::open("manifest").unwrap());
-    /// let sstables: Vec<SSTable> = reader.read_sstables(true).unwrap();
-    /// ```
-    fn read_sstables(&mut self, stop_at_invalid: bool) -> io::Result<Vec<SSTable>> {
-        let mut sstables = Vec::<Option<SSTable>>::new();
-
-        loop {
-            let entry = self.read_entry();
-
-            match entry {
-                Ok(ReadResult::Entry(Entry::AddSSTable(add_sstable))) => {
-                    sstables.push(Some(add_sstable.sstable));
-                }
-
-                Ok(ReadResult::Entry(Entry::RemoveSSTable(remove_sstable))) => {
-                    let index = sstables.iter().position(|sstable| {
-                        sstable
-                            .as_ref()
-                            .map(|sstable| sstable.id == remove_sstable.id)
-                            .unwrap_or(false)
-                    });
-
-                    if let Some(index) = index {
-                        sstables[index] = None;
-                    }
-                }
-
-                Ok(ReadResult::Invalid) => {
-                    if !stop_at_invalid {
-                        continue;
-                    }
-
-                    break;
-                }
-
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        break;
-                    }
-
-                    return Err(e);
-                }
-            }
-        }
-
-        sstables.sort_by(|a, b| {
-            a.as_ref()
-                .map(|a| (a.level, a.id))
-                .cmp(&b.as_ref().map(|b| (b.level, b.id)))
-        });
-
-        Ok(sstables.into_iter().flatten().collect())
-    }
-
-    /// Reads a single entry from the file from the current position.
-    fn read_entry(&mut self) -> io::Result<ReadResult> {
-        let crc = self.0.read_u32()?;
-
-        let length = self.0.read_u32()?;
-        let buf = self.0.read_bytes_with_len(length as usize)?;
-
-        if crc != crc32c(&buf) {
-            return Ok(ReadResult::Invalid);
-        }
-
-        let mut reader = Cursor::new(buf);
-
-        let ty = reader.read_u8()?;
-        if ty == TYPE_ADD_SSTABLE {
-            let level = reader.read_u8()?;
-            let min_key = reader.read_string()?;
-            let max_key = reader.read_string()?;
-            let id = reader.read_u64()?;
-
-            Ok(ReadResult::Entry(Entry::AddSSTable(AddSSTable {
-                sstable: SSTable {
-                    level,
-                    min_key,
-                    max_key,
-                    id,
-                },
-            })))
-        } else if ty == TYPE_REMOVE_SSTABLE {
-            let id = reader.read_u64()?;
-
-            Ok(ReadResult::Entry(Entry::RemoveSSTable(RemoveSSTable {
-                id,
-            })))
-        } else {
-            Ok(ReadResult::Invalid)
-        }
-    }
-}
-
-/// Writer for manifest files.
-///
-/// Not thread-safe.
-///
-/// Manifest file format is specified in [docs/manifest-file-spec.md](docs/manifest-file-spec.md).
-///
-/// Example:
-///
-/// ```ignore
-/// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
-/// let mut transaction = writer.transaction();
-/// transaction.add_sstable(0, "key1", "key2").unwrap();
-/// transaction.commit().unwrap();
-/// ```
-///
-/// This struct itself does not provide any write functionality. Instead, it provides a [`ManifestTransaction`]
-/// which can be used to write entries to the manifest file and atomically commited to the file.
-///
-/// Since the Transaction borrows the writer mutably, the borrow checker ensures that only one transation is running
-/// at a time.
-pub struct ManifestWriter {
-    file: File,
-
-    lock_path: PathBuf,
-    lock: File,
-}
-
-impl ManifestWriter {
-    /// Opens a manifest file for writing.
-    ///
-    /// If the file does not exist, it will be created.
-    ///
-    /// Additionally, creates a lock file to prevent multiple writers from writing to the same file.
-    ///
-    /// On open, it will compact the manifest file if it already exists.
-    pub fn open(path: PathBuf) -> io::Result<ManifestWriter> {
-        let lock_path = path.clone().with_extension("lock");
-
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
-
-        lock.try_lock_exclusive()?;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-
-        let pos = file.seek(SeekFrom::End(0))?;
-
-        let mut writer = ManifestWriter::new(file, lock_path, lock);
-
-        if pos == 0 {
-            writer.init()?;
-        } else {
-            writer.compact()?;
-        }
-
-        Ok(writer)
-    }
-
-    fn new(inner: File, lock_path: PathBuf, lock: File) -> ManifestWriter {
-        ManifestWriter {
-            file: inner,
-            lock_path,
-            lock,
-        }
-    }
-
-    fn init(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.set_len(0)?;
-
-        // Magic number
-        self.file.write_u32(MAGIC)?;
-
-        // Version
-        self.file.write_u8(1)?;
-
-        // Next SST file ID
-        self.file.write_u64(0)?;
-        self.file.sync_all()?;
-
-        Ok(())
-    }
-
-    fn compact(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        let manifest = ManifestReader::new(&mut self.file)
-            .read_skip_invalid()?;
-
-        let mut txn = self.transaction();
-
-        txn.clear();
-
-        for sstable in manifest.sstables {
-            txn.write_sstable_with_id(
-                sstable.level,
-                &sstable.min_key,
-                &sstable.max_key,
-                sstable.id,
-            )?;
-        }
-
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    ///  Starts a new transaction. Writing to the manifest file is done through this transaction.
-    pub fn transaction(&mut self) -> ManifestTransaction {
-        ManifestTransaction {
-            inner: self,
-            write_buf: Vec::new(),
-            clear: false,
-            next_sst_id: None,
-        }
-    }
-}
-
-impl Drop for ManifestWriter {
-    fn drop(&mut self) {
-        // There's little we can do if this fails.
-        let _ = fs2::FileExt::unlock(&self.lock);
-        let _ = fs::remove_file(&self.lock_path);
-    }
-}
-
-/// A manifest transaction.
-///
-/// This batches writes in a buffer so that they can be atomically commited to the file at the same time
-/// and avoiding partial writes or inconsistent states.
-pub struct ManifestTransaction<'a> {
-    inner: &'a mut ManifestWriter,
-    write_buf: Vec<u8>,
-    clear: bool,
-    next_sst_id: Option<u64>,
-}
-
-impl<'a> ManifestTransaction<'a> {
-    /// Commits the transaction to the manifest file.
-    ///
-    /// All the buffered writes are flushed to the file at the same time.
-    ///
-    /// Consumes the transaction so that it can't be used anymore.
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
-    /// let mut transaction = writer.transaction();
-    /// transaction.add_sstable(0, "key1", "key2").unwrap();
-    /// transaction.commit().unwrap();
-    /// ```
-    pub fn commit(self) -> io::Result<()> {
-        if let Some(next_sst_id) = self.next_sst_id {
-            self.inner.file.seek(SeekFrom::Start(5))?;
-            self.inner.file.write_u64(next_sst_id)?;
-            self.inner.file.seek(SeekFrom::End(0))?;
-        }
-
-        if self.clear {
-            self.inner.file.seek(SeekFrom::Start(13))?;
-            self.inner.file.set_len(13)?;
-        }
-
-        self.inner.file.write_all(&self.write_buf)?;
-        self.inner.file.sync_data()?;
-        drop(self);
-
-        Ok(())
-    }
-
-    /// Cleans the manifest file when the transaction is committed.
-    ///
-    /// Note that is does not clear entries that were previously added in this
-    /// transaction.
-    fn clear(&mut self) {
-        self.clear = true;
-    }
-
-    /// Batch a new sstable addition to the manifest file.
-    ///
-    /// Returns the ID of the added sstable that will be written to the file.
-    pub fn add_sstable(
-        &mut self,
-        level: u8,
-        min_key: &str,
-        max_key: &str
-    ) -> io::Result<u64> {
-        let id = self.allocate_sstable_id()?;
-        self.write_sstable_with_id(level, min_key, max_key, id)?;
-
-        Ok(id)
-    }
-
-    fn write_sstable_with_id(
-        &mut self,
-        level: u8,
-        min_key: &str,
-        max_key: &str,
-        id: u64
-    ) -> io::Result<()> {
-        let mut buf = Vec::new();
-
-        buf.write_u8(TYPE_ADD_SSTABLE)?;
-        buf.write_u8(level)?;
-        buf.write_string(min_key)?;
-        buf.write_string(max_key)?;
-        buf.write_u64(id)?;
-
-        let crc = crc32c(&buf);
-
-        self.write_buf.write_u32(crc)?;
-        self.write_buf.write_u32(buf.len() as u32)?;
-        self.write_buf.write_all(&buf)?;
-
-        Ok(())
-    }
-
-    fn allocate_sstable_id(&mut self) -> io::Result<u64> {
-        let current = self.next_sst_id;
-
-        let id = if let Some(current) = current {
-            current
-        } else {
-            self.inner.file.seek(SeekFrom::Start(5))?;
-            let id = self.inner.file.read_u64()?;
-            self.inner.file.seek(SeekFrom::End(0))?;
-
-            id
-        };
-
-        self.next_sst_id = Some(id + 1);
-
-        Ok(id)
-    }
-
-    /// Batch a sstable removal from the manifest file.
-    ///
-    /// Example:
-    ///
-    /// ```ignore
-    /// let writer = ManifestWriter::open(PathBuf::from("manifest")).unwrap();
-    /// let mut transaction = writer.transaction();
-    /// transaction.remove_sstable(0).unwrap();
-    /// transaction.commit().unwrap();
-    /// ```
-    pub fn remove_sstable(&mut self, id: u64) -> io::Result<()> {
-        let mut buf = Vec::new();
-
-        buf.write_u8(TYPE_REMOVE_SSTABLE)?;
-        buf.write_u64(id)?;
-
-        let crc = crc32c(&buf);
-
-        self.write_buf.write_u32(crc)?;
-        self.write_buf.write_u32(buf.len() as u32)?;
-        self.write_buf.write_all(&buf)?;
-
-        Ok(())
-    }
-
-    pub fn remove_sstables(&mut self, ids: Vec<u64>) -> io::Result<()> {
-        for id in ids {
-            self.remove_sstable(id)?;
-        }
+        drop(writer);
+        drop(lock);
 
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     use std::ops::Bound;
+    use std::fs;
 
     #[test]
     fn test_manifest_can_be_written_and_read() {
-        let filename = "test_manifest_can_be_written_and_read";
-
-        if PathBuf::from(filename).exists() {
-            fs::remove_file(filename).unwrap();
+        let path = PathBuf::from("test_manifest_can_be_written_and_read");
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
         }
 
-        let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
-        let mut transaction = writer.transaction();
-        transaction.add_sstable(0, "key1", "key2").unwrap();
-        transaction.commit().unwrap();
+        fs::create_dir(&path).unwrap();
 
-        let reader = File::open(filename).unwrap();
-        let sstables = ManifestReader::new(reader).read().unwrap();
-        assert_eq!(sstables.sstables.len(), 1);
-        assert_eq!(sstables.sstables[0].id, 0);
-    }
+        let manifest = Manifest::open(&path).unwrap();
+        let mut update = manifest.start_update();
+        update.add(0, "key1", "key2");
+        manifest.update(update).unwrap();
+        drop(manifest);
 
-    #[test]
-    fn test_manifest_does_not_persist_until_commit() {
-        let filename = "test_manifest_does_not_persist_until_commit";
-
-        if PathBuf::from(filename).exists() {
-            fs::remove_file(filename).unwrap();
-        }
-
-        let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
-
-        let mut transaction = writer.transaction();
-        transaction.add_sstable(0, "key1", "key2").unwrap();
-
-        let reader = File::open(filename).unwrap();
-        let sstables = ManifestReader::new(reader).read().unwrap();
-        assert_eq!(sstables.sstables.len(), 0);
-
-        transaction.commit().unwrap();
-
-        let reader = File::open(filename).unwrap();
-        let sstables = ManifestReader::new(reader).read().unwrap();
-        assert_eq!(sstables.sstables.len(), 1);
-        assert_eq!(sstables.sstables[0].id, 0);
+        let manifest = Manifest::open(&path).unwrap();
+        let sstables = manifest.get_sstables();
+        assert_eq!(sstables.len(), 1);
+        assert_eq!(sstables[0].id, 0);
     }
 
     #[test]
     fn test_first_sstable_id_is_0() {
-        let filename = "test_first_sstable_id_is_0";
-
-        if PathBuf::from(filename).exists() {
-            fs::remove_file(filename).unwrap();
+        let path = PathBuf::from("test_first_sstable_id_is_0");
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
         }
 
-        let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
-        let mut transaction = writer.transaction();
-        let id = transaction.add_sstable(0, "key1", "key2").unwrap();
+        fs::create_dir(&path).unwrap();
 
-        assert_eq!(id, 0);
+        let manifest = Manifest::open(&path).unwrap();
+        let mut update = manifest.start_update();
+        update.add(0, "key1", "key2");
+        manifest.update(update).unwrap();
 
-        transaction.commit().unwrap();
+        let sstables = manifest.get_sstables();
+        assert_eq!(sstables.len(), 1);
+        assert_eq!(sstables[0].id, 0);
 
-        let reader = File::open(filename).unwrap();
-        let sstables = ManifestReader::new(reader).read().unwrap();
-        assert_eq!(sstables.sstables.len(), 1);
-        assert_eq!(sstables.sstables[0].id, 0);
+        drop(manifest);
+
+        let manifest = Manifest::open(&path).unwrap();
+        let sstables = manifest.get_sstables();
+        assert_eq!(sstables.len(), 1);
+        assert_eq!(sstables[0].id, 0);
     }
 
     #[test]
     fn test_manifest_persists_item_removal_on_reopen() {
-        let filename = "test_manifest_persists_item_removal_on_reopen";
-
-        if PathBuf::from(filename).exists() {
-            fs::remove_file(filename).unwrap();
+        let path = PathBuf::from("test_manifest_persists_item_removal_on_reopen");
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
         }
 
-        let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
-        let mut transaction = writer.transaction();
-        let id0 = transaction.add_sstable(0, "key1", "key2").unwrap();
-        let id1 = transaction.add_sstable(0, "key2", "key3").unwrap();
-        transaction.remove_sstable(id0).unwrap();
-        transaction.remove_sstable(id1).unwrap();
-        let id2 = transaction.add_sstable(0, "key3", "key4").unwrap();
-        let id3 = transaction.add_sstable(0, "key4", "key5").unwrap();
-        transaction.commit().unwrap();
+        fs::create_dir(&path).unwrap();
 
-        drop(writer);
+        let manifest = Manifest::open(&path).unwrap();
 
-        let reader = File::open(filename).unwrap();
-        let sstables = ManifestReader::new(reader).read().unwrap();
-        assert_eq!(sstables.sstables.len(), 2);
-        assert_eq!(sstables.sstables[0].id, id2);
-        assert_eq!(sstables.sstables[1].id, id3);
+        let mut update = manifest.start_update();
+        let id0 = update.add(0, "key1", "key2");
+        let id1 = update.add(0, "key2", "key3");
+        manifest.update(update).unwrap();
 
-        let writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
+        let mut update = manifest.start_update();
+        update.remove(id0);
+        update.remove(id1);
+        let id2 = update.add(0, "key3", "key4");
+        let id3 = update.add(0, "key4", "key5");
+        manifest.update(update).unwrap();
 
-        let reader = File::open(filename).unwrap();
-        let sstables = ManifestReader::new(reader).read().unwrap();
-        assert_eq!(sstables.sstables.len(), 2);
-        assert_eq!(sstables.sstables[0].id, id2);
-        assert_eq!(sstables.sstables[1].id, id3);
+        let sstables = manifest.get_sstables();
+        assert_eq!(sstables.len(), 2);
+        assert_eq!(sstables[0].id, id3);
+        assert_eq!(sstables[1].id, id2);
 
-        drop(writer);
+        drop(manifest);
+
+        let manifest = Manifest::open(&path).unwrap();
+        let sstables = manifest.get_sstables();
+        assert_eq!(sstables.len(), 2);
+        assert_eq!(sstables[0].id, id3);
+        assert_eq!(sstables[1].id, id2);
     }
 
     #[test]
     fn test_manifest_returns_candidates_in_range() {
-        let filename = "test_manifest_returns_candidates_in_rang";
-
-        if PathBuf::from(filename).exists() {
-            fs::remove_file(filename).unwrap();
+        let path = PathBuf::from("test_manifest_returns_candidates_in_range");
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
         }
 
-        let mut writer = ManifestWriter::open(PathBuf::from(filename)).unwrap();
-        let mut transaction = writer.transaction();
-        let id0 = transaction.add_sstable(0, "key10", "key20").unwrap();
-        let id1 = transaction.add_sstable(0, "key20", "key30").unwrap();
-        let id2 = transaction.add_sstable(0, "key25", "key35").unwrap();
-        let id3 = transaction.add_sstable(0, "key00", "key99").unwrap();
-        transaction.commit().unwrap();
-        drop(writer);
+        fs::create_dir(&path).unwrap();
 
-        let get_candidates = |range: (Bound<&str>, Bound<&str>)| {
-            let reader = File::open(filename).unwrap();
-            ManifestReader::new(reader)
-                .get_candidate_sstables_for_range(range)
-                .unwrap()
-                .iter()
-                .map(|it| it.id)
-                .collect::<Vec<_>>()
-        };
+        let mut manifest = Manifest::open(&path).unwrap();
+        let mut update = manifest.start_update();
+        let id0 = update.add(0, "key10", "key20");
+        let id1 = update.add(0, "key20", "key30");
+        let id2 = update.add(0, "key25", "key35");
+        let id3 = update.add(0, "key00", "key99");
+        manifest.update(update).unwrap();
 
-        // empty
-        assert_eq!(get_candidates((Excluded("key15"), Excluded("key15"))), vec![]);
-        assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
-        assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
 
-        // single
-        assert_eq!(get_candidates((Included("key15"), Excluded("key16"))), vec![id0, id3]);
-        assert_eq!(get_candidates((Excluded("key15"), Excluded("key17"))), vec![id0, id3]);
+        for _ in 0..2 {
+            let get_candidates = |range: (Bound<&str>, Bound<&str>)| {
+                manifest.get_candidate_sstables_for_range(range)
+                    .iter().
+                    map(|it| it.id)
+                    .collect::<Vec<_>>()
+            };
 
-        // min unbounded
-        assert_eq!(get_candidates((Unbounded, Included("key16"))), vec![id0, id3]);
-        assert_eq!(get_candidates((Unbounded, Excluded("key17"))), vec![id0, id3]);
+            // empty
+            assert_eq!(get_candidates((Excluded("key15"), Excluded("key15"))), vec![]);
+            assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
+            assert_eq!(get_candidates((Included("key15"), Excluded("key15"))), vec![]);
 
-        // max unbounded
-        assert_eq!(get_candidates((Included("key30"), Unbounded)), vec![id1, id2, id3]);
-        assert_eq!(get_candidates((Excluded("key30"), Unbounded)), vec![id2, id3]);
+            // single
+            assert_eq!(get_candidates((Included("key15"), Excluded("key16"))), vec![id3, id0]);
+            assert_eq!(get_candidates((Excluded("key15"), Excluded("key17"))), vec![id3, id0]);
 
-        // intersection
-        assert_eq!(get_candidates((Included("key22"), Excluded("key25"))), vec![id1, id3]);
-        assert_eq!(get_candidates((Included("key22"), Included("key25"))), vec![id1, id2, id3]);
-        assert_eq!(get_candidates((Excluded("key20"), Included("key25"))), vec![id1, id2, id3]);
-        assert_eq!(get_candidates((Included("key20"), Included("key25"))), vec![id0, id1, id2, id3]);
+            // min unbounded
+            assert_eq!(get_candidates((Unbounded, Included("key16"))), vec![id3, id0]);
+            assert_eq!(get_candidates((Unbounded, Excluded("key17"))), vec![id3, id0]);
+
+            // max unbounded
+            assert_eq!(get_candidates((Included("key30"), Unbounded)), vec![id3, id2, id1]);
+            assert_eq!(get_candidates((Excluded("key30"), Unbounded)), vec![id3, id2]);
+
+            // intersection
+            assert_eq!(get_candidates((Included("key22"), Excluded("key25"))), vec![id3, id1]);
+            assert_eq!(get_candidates((Included("key22"), Included("key25"))), vec![id3, id2, id1]);
+            assert_eq!(get_candidates((Excluded("key20"), Included("key25"))), vec![id3, id2, id1]);
+            assert_eq!(get_candidates((Included("key20"), Included("key25"))), vec![id3, id2, id1, id0]);
+
+            // another pass of same checks after re-opening manifest
+            drop(manifest);
+            manifest = Manifest::open(&path).unwrap();
+        }
     }
 }
+
