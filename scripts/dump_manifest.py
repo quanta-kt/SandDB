@@ -22,36 +22,42 @@ with open(file, "rb") as f:
     f.seek(0)
     magic = read_u32(f)
     version = read_u8(f)
-    next_sst_id = read_u64(f)
 
     print(f"=== HEADER ===")
     print(f"  magic: {hex(magic)}")
     print(f"  version: {version}")
-    print(f"  next_sst_id: {next_sst_id}\n")
 
     while True:
         crc = read_u32(f)
         length = read_u32(f)
-        tt = read_u8(f)
+        next_sst_id = read_u64(f)
 
         print(f"=== ENTRY ===")
         print(f"  crc: {hex(crc)}")
         print(f"  length: {length}")
-        print(f"  type: {tt}")
+        print(f"  next_sst_id: {next_sst_id}\n")
 
-        if tt == 1:
+
+        added_count = read_u64(f)
+        print(f"  === ADDED {added_count} SSTs ===")
+
+        for i in range(added_count):
+            eid = read_u64(f)
             level = read_u8(f)
             min_key = read_string(f)
             max_key = read_string(f)
-            eid = read_u64(f)
 
-            print(f"  level: {level}")
-            print(f"  min_key: {min_key}")
-            print(f"  max_key: {max_key}")
-            print(f"  id: {eid}\n")
-        elif tt == 2:
+            print(f"    id: {eid}")
+            print(f"    level: {level}")
+            print(f"    min_key: {min_key}")
+            print(f"    max_key: {max_key}\n")
+
+        removed_count = read_u64(f)
+        print(f"  === REMOVED {removed_count} SSTs ===")
+
+        for i in range(removed_count):
             eid = read_u64(f)
-            print(f"  id: {eid}\n")
+            print(f"    id: {eid}")
 
         current_pos = f.tell()
         if current_pos == f.seek(0, os.SEEK_END):

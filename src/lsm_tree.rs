@@ -7,15 +7,15 @@ use std::{
 };
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use fs2::FileExt;
 
 use crate::{
     Store,
-    manifest::{Manifest, ManifestReader, ManifestWriter, SSTable},
     sstable::reader::{CachedSSTableReader, FsSSTReader, SSTableReader},
 };
+use crate::manifest::Manifest;
+use crate::manifest::SSTableDesc;
 use crate::sstable::writer::SSTableWriter;
 use crate::store::Cursor;
 use crate::util::merge_sorted_uniq_cursor;
@@ -31,7 +31,7 @@ pub struct LSMTree<S: SSTableReader> {
     directory: PathBuf,
     lock: Option<File>,
 
-    manifest_writer: Mutex<ManifestWriter>,
+    manifest: Manifest,
     sstable_reader: S,
 
     // Number of level-0 SSTables.
@@ -59,13 +59,13 @@ impl LSMTree<CachedSSTableReader<FsSSTReader>> {
 
         lock.try_lock_exclusive()?;
 
-        let manifest_writer = ManifestWriter::open(directory.join("manifest"))?;
+        let manifest = Manifest::open(&directory)?;
         let sstable_reader = FsSSTReader::new(directory.clone()).cached();
 
         Ok(Self {
             directory,
             lock: Some(lock),
-            manifest_writer: Mutex::new(manifest_writer),
+            manifest,
             sstable_reader,
             level_zero_count: AtomicU8::new(0),
         })
@@ -73,28 +73,10 @@ impl LSMTree<CachedSSTableReader<FsSSTReader>> {
 }
 
 impl<S: SSTableReader> LSMTree<S> {
-    fn manifest_reader(&self) -> io::Result<ManifestReader<File>> {
-        let manifest_path = self.directory.join("manifest");
-        let manifest_file = File::open(manifest_path)?;
-        Ok(ManifestReader::new(manifest_file))
-    }
-
-    fn read_manifest(&self) -> Result<Manifest, io::Error> {
-        let manifest = self.manifest_reader()?.read()?;
-
-        // Each time we read the manifest, we update the level zero count
-        self.level_zero_count.store(
-            manifest.sstables.iter().filter(|it| it.level == 0).count() as u8, 
-            Ordering::Relaxed
-        );
-
-        Ok(manifest)
-    }
-
     pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        let candidate_ssts = self.manifest_reader()?.get_candidate_sstables_for_key(key)?;
+        let candidate_ssts = self.manifest.get_candidate_sstables_for_key(key);
 
-        for candidate in candidate_ssts.iter().rev() {
+        for candidate in candidate_ssts {
             let candidate_chunks = self
                 .sstable_reader
                 .get_candidate_chunks_for_key(candidate.id, key)?;
@@ -115,13 +97,9 @@ impl<S: SSTableReader> LSMTree<S> {
         &'a self,
         range: R,
     ) -> io::Result<impl Cursor + 'a> {
-        let mut candidate_ssts = self
-            .manifest_reader()?
-            .get_candidate_sstables_for_range(range.clone())?;
-
-        // Since manifest is ordered oldest to most recent, we need to reverse the list
-        // to pick the most recent entries during the merge.
-        candidate_ssts.reverse();
+        let candidate_ssts = self
+            .manifest
+            .get_candidate_sstables_for_range(range.clone());
 
         let mut iters = Vec::with_capacity(candidate_ssts.len());
 
@@ -175,19 +153,15 @@ impl<S: SSTableReader> LSMTree<S> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source is empty"))?
             .0;
 
-        let mut writer = self.manifest_writer.lock().or_else(|_| {
-            Err(io::Error::new(io::ErrorKind::Other, "Unable to aquire lock on manifest writer: mutex poisoned"))
-        })?;
-        let mut txn = writer.transaction();
-        let id = txn.add_sstable(0, min_key, max_key)?;
+        let mut update = self.manifest.start_update();
+        let id = update.add(0, min_key, max_key);
 
         let mut writer = SSTableWriter::open(&self.directory, id)?;
         for (key, value) in source.iter() {
             writer.write(key, value)?;
         }
         writer.finalize()?;
-
-        txn.commit()?;
+        self.manifest.update(update)?;
 
         self.level_zero_count.fetch_add(1, Ordering::Relaxed);
 
@@ -218,11 +192,8 @@ impl<S: SSTableReader> LSMTree<S> {
 
     fn compact_level(&self, level: u8) -> io::Result<bool> {
         let to_compact = self
-            .read_manifest()?
-            .sstables
-            .into_iter()
-            .filter(|it| it.level == level)
-            .collect::<Vec<_>>();
+            .manifest
+            .get_sstables_at_level(level);
 
         if to_compact.len() < COMPACT_EVERY_N_SSTABLES as usize {
             return Ok(false);
@@ -239,12 +210,7 @@ impl<S: SSTableReader> LSMTree<S> {
         Ok(true)
     }
 
-    fn merge_ssts(&self, mut to_merge: Vec<SSTable>, target_level: u8) -> io::Result<()> {
-        // Since we want to keep the most recent value for a key, we need to reverse the list
-        // to pick the most recent value for a key as manifest is ordered oldest to most recent.
-        // See [`util::merge_sorted_uniq`].
-        to_merge.reverse();
-
+    fn merge_ssts(&self, to_merge: Vec<SSTableDesc>, target_level: u8) -> io::Result<()> {
         let min_key = to_merge
             .iter()
             .map(|it| it.min_key.as_str())
@@ -277,13 +243,13 @@ impl<S: SSTableReader> LSMTree<S> {
 
         let merged = merge_sorted_uniq_cursor(sources);
 
-        let mut writer = self.manifest_writer.lock().or_else(|_| {
-            Err(io::Error::new(io::ErrorKind::Other, "Unable to aquire lock on manifest writer: mutex poisoned"))
-        })?;
-        let mut txn = writer.transaction();
-        txn.remove_sstables(to_merge.iter().map(|it| it.id).collect())?;
+        let mut update = self.manifest.start_update();
 
-        let sst_id = txn.add_sstable(target_level, &min_key, max_key)?;
+        for sstable in to_merge.iter() {
+            update.remove(sstable.id);
+        }
+
+        let sst_id = update.add(target_level, &min_key, max_key);
 
         let mut writer = SSTableWriter::open(&self.directory, sst_id)?;
         for item in merged {
@@ -291,7 +257,8 @@ impl<S: SSTableReader> LSMTree<S> {
             writer.write(key, value)?;
         }
         writer.finalize()?;
-        txn.commit()?;
+
+        self.manifest.update(update)?;
 
         for table in to_merge.iter() {
             let path = sst_file_path(&self.directory, table.id);
@@ -369,14 +336,14 @@ mod tests {
             .unwrap();
         }
 
-        let manifest_reader =
-            ManifestReader::new(File::open(PathBuf::from(filename).join("manifest")).unwrap());
-        let sstables = manifest_reader.read().unwrap();
+        drop(tree);
+
+        let manifest = Manifest::open(filename).unwrap();
 
         // group by levels
         let mut levels = BTreeMap::new();
 
-        for sstable in sstables.sstables {
+        for sstable in manifest.get_sstables() {
             levels
                 .entry(sstable.level)
                 .or_insert(Vec::new())
@@ -413,14 +380,12 @@ mod tests {
                 .unwrap();
             }
 
-            let manifest_reader =
-                ManifestReader::new(File::open(PathBuf::from(filename).join("manifest")).unwrap());
-            let sstables = manifest_reader.read().unwrap();
+            let manifest = Manifest::open(PathBuf::from(filename)).unwrap();
 
             // group by levels
             let mut levels = BTreeMap::new();
 
-            for sstable in sstables.sstables {
+            for sstable in manifest.get_sstables() {
                 levels
                     .entry(sstable.level)
                     .or_insert(Vec::new())
@@ -460,19 +425,21 @@ mod tests {
         ]))
         .unwrap();
 
-        let ssts = tree.manifest_reader().unwrap().read().unwrap();
+        let ssts = tree.manifest.get_sstables();
 
-        tree.merge_ssts(ssts.sstables, 1).unwrap();
+        tree.merge_ssts(ssts, 1).unwrap();
+
+        drop(tree);
 
         // We expect these SSTables to be merged into a single SSTable at level 1, with ID 2
 
         // Verify manifest
-        let manifest_reader = ManifestReader::new(File::open(path.join("manifest")).unwrap());
-        let sstables = manifest_reader.read().unwrap();
-        assert_eq!(sstables.sstables.len(), 1);
-        assert_eq!(sstables.sstables[0].id, 2);
-        assert_eq!(sstables.sstables[0].level, 1);
-        assert_eq!(sstables.sstables[0].min_key, "key1");
+        let manifest = Manifest::open(&path).unwrap();
+        let sstables = manifest.get_sstables();
+        assert_eq!(sstables.len(), 1);
+        assert_eq!(sstables[0].id, 2);
+        assert_eq!(sstables[0].level, 1);
+        assert_eq!(sstables[0].min_key, "key1");
 
         // Verify SSTable
         let sstable_reader = FsSSTReader::new(path.clone());
