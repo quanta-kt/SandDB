@@ -8,6 +8,14 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::iter::Iterator;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::SystemTime;
+use std::thread;
+use std::time::UNIX_EPOCH;
+
+use portable_atomic::AtomicU128;
 
 use crate::crc;
 use crate::io_ext::ReadExt;
@@ -20,8 +28,10 @@ const FILENAME: &'static str = "wal.log";
 
 pub struct Wal {
     wal: File,
+    fsync_thread_join_handle: Option<thread::JoinHandle<()>>,
+    last_update: Arc<AtomicU128>,
+    stop_fsync: Arc<AtomicBool>,
 }
-
 
 impl Wal {
 
@@ -45,23 +55,59 @@ impl Wal {
             dir.sync_all()?;
         }
 
+        let stop_fsync = Arc::new(AtomicBool::new(false));
+        let last_update = Arc::new(AtomicU128::new(now()));
+
+        let wal_dup = wal.try_clone()?;
+        let stop_fsync_dup = stop_fsync.clone();
+        let last_update_dup = last_update.clone();
+
+        let fsync_thread_join_handle = Some(thread::spawn(move || {
+            run_fsync(wal_dup, stop_fsync_dup, last_update_dup);
+        }));
+
+
         Ok(Self {
             wal,
+            fsync_thread_join_handle,
+            last_update,
+            stop_fsync,
         })
     }
 
+    pub fn log_one_no_fsync(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
+        let mut buf = Vec::new();
+        buf.write_string(key)?;
+        buf.write_bytes(value)?;
+
+        let len = buf.len() as u64;
+
+        let crc = crc::crc32c_iter(
+            len.to_be_bytes()
+                .iter()
+                .chain(buf.iter())
+                .cloned()
+        );
+
+        self.wal.write_u32(crc)?;
+        self.wal.write_u64(buf.len() as u64)?;
+        self.wal.write_all(&buf)?;
+
+        Ok(())
+    }
+
     pub fn log_one(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.log_one_no_sync(key, value)?;
-        self.wal.sync_data()?;
+        self.log_one_no_fsync(key, value)?;
+        self.last_update.store(now(), Ordering::Relaxed);
         Ok(())
     }
 
     pub fn log_many(&mut self, items: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
         for (key, value) in items.iter() {
-            self.log_one_no_sync(key, value)?;
+            self.log_one_no_fsync(key, value)?;
         }
 
-        self.wal.sync_data()?;
+        self.last_update.store(now(), Ordering::Relaxed);
 
         Ok(())
     }
@@ -130,27 +176,6 @@ impl Wal {
         Ok(Some((key, value)))
     }
 
-    fn log_one_no_sync(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
-        let mut buf = Vec::new();
-        buf.write_string(key)?;
-        buf.write_bytes(value)?;
-
-        let len = buf.len() as u64;
-
-        let crc = crc::crc32c_iter(
-            len.to_be_bytes()
-                .iter()
-                .chain(buf.iter())
-                .cloned()
-        );
-
-        self.wal.write_u32(crc)?;
-        self.wal.write_u64(buf.len() as u64)?;
-        self.wal.write_all(&buf)?;
-
-        Ok(())
-    }
-
     fn write_header(&mut self) -> io::Result<()> {
         self.wal.write_u32(MAGIC)?;
         self.wal.write_u8(VERSION)?;
@@ -173,5 +198,40 @@ impl Wal {
         Ok(())
     }
 
+}
+
+fn run_fsync(file: File, stop: Arc<AtomicBool>, last_update: Arc<AtomicU128>) {
+    let mut last_sync = 0;
+
+
+    loop {
+        if last_sync < last_update.load(Ordering::Relaxed) {
+            last_sync = now();
+            let _ = file.sync_data();
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        self.stop_fsync.swap(true, Ordering::Relaxed);
+
+        if let Some(handle) = self.fsync_thread_join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
 
